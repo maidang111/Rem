@@ -1,0 +1,15 @@
+# High-blast-radius / system-wide packages.
+#
+# Alerts for these are ALWAYS routed to a reviewed Devin upgrade (careful-review
+# prompt) and bypass the "Dependabot already has a PR" dedup skip, because an
+# unreviewed insta-bump of a widely-used dependency is risky.
+#
+# One package per line. Blank lines and text after "#" are ignored. Names are
+# case-insensitive and a leading npm scope "@" is optional (babel/core == @babel/core).
+# Extras can also be added via the SENSITIVE_PACKAGES env var (comma-separated).
+#
+# Uncomment / add the packages that matter for your codebase, e.g.:
+# sqlalchemy
+# flask
+# react
+# @babel/core

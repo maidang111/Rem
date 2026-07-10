@@ -50,13 +50,35 @@ SCOPE_ORDER = {"development": 0}  # everything else (runtime / unknown) ranks hi
 
 # Packages considered high-blast-radius / system-wide. An unreviewed insta-bump of
 # these is risky, so they are ALWAYS routed to a reviewed Devin upgrade -- even when
-# Dependabot already opened a PR (i.e. they bypass the dedup skip). Comma-separated,
-# case-insensitive, leading npm scope "@" ignored (e.g. "sqlalchemy,react,@babel/core").
-SENSITIVE_PACKAGES = {
-    p.strip().lower().lstrip("@")
-    for p in os.getenv("SENSITIVE_PACKAGES", "").split(",")
-    if p.strip()
-}
+# Dependabot already opened a PR (i.e. they bypass the dedup skip).
+#
+# The list lives in its own file (default: sensitive_packages.txt, override with
+# SENSITIVE_PACKAGES_FILE) -- one package per line, blank lines and "#" comments
+# ignored. The SENSITIVE_PACKAGES env var may still add extras (comma-separated).
+# All names are normalized: lower-cased, leading npm scope "@" stripped.
+SENSITIVE_PACKAGES_FILE = os.getenv("SENSITIVE_PACKAGES_FILE", "sensitive_packages.txt")
+
+
+def _normalize_sensitive(name):
+    return name.strip().lower().lstrip("@")
+
+
+def load_sensitive_packages(path=SENSITIVE_PACKAGES_FILE):
+    """Read the sensitive-package list from `path` (if present) plus the env var."""
+    packages = set()
+    if path and os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()  # drop inline comments
+                if line:
+                    packages.add(_normalize_sensitive(line))
+    for entry in os.getenv("SENSITIVE_PACKAGES", "").split(","):
+        if entry.strip():
+            packages.add(_normalize_sensitive(entry))
+    return packages
+
+
+SENSITIVE_PACKAGES = load_sensitive_packages()
 
 
 def require_config():
