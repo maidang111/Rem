@@ -317,16 +317,43 @@ def main():
         help="Print categorization and decisions without creating Devin sessions.",
     )
     parser.add_argument("--repo", default=SCAN_REPO, help=f"Repo to scan (default: {SCAN_REPO}).")
+    parser.add_argument(
+        "--force",
+        action="append",
+        default=[],
+        metavar="GHSA_ID",
+        help=("Re-dispatch this alert even if it is already recorded in state "
+              "(e.g. its PR was closed). Repeatable or comma-separated."),
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Clear all recorded state before scanning, so every open alert is reconsidered.",
+    )
     args = parser.parse_args()
 
     require_config()
+
+    # Normalize --force values (accept repeated flags and comma-separated lists).
+    forced = {
+        g.strip().lower()
+        for item in args.force
+        for g in item.split(",")
+        if g.strip()
+    }
 
     repo = args.repo
     print(f"Scanning open Dependabot alerts for {repo} ...")
     alerts = fetch_open_alerts(repo)
     print(f"Found {len(alerts)} open alert(s).")
 
-    state = load_state()
+    if args.reset:
+        state = {}
+        if not args.dry_run and os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+        print("Reset: ignoring existing state; every open alert will be reconsidered.")
+    else:
+        state = load_state()
 
     # Dependabot auto-opens PRs for the trivial patch-available bumps; skip those so
     # Devin only handles what Dependabot can't (breaking/major bumps, no clean patch).
@@ -341,9 +368,12 @@ def main():
         key = state_key(repo, cat)
         label = f"[{cat['severity']}] {cat['package']} ({cat['ghsa_id']})"
 
-        if key in state:
+        is_forced = (cat["ghsa_id"] or "").lower() in forced
+        if key in state and not is_forced:
             print(f"SKIP  {label}: already handled ({state[key].get('session_url', 'no url')})")
             continue
+        if key in state and is_forced:
+            print(f"FORCE {label}: re-dispatching (was already handled)")
 
         dispatch, reason = should_dispatch(cat)
         if not dispatch:

@@ -151,7 +151,20 @@ python dependabot_scan.py
 
 # Override the repo for a single run
 python dependabot_scan.py --repo owner/name
+
+# Re-dispatch a specific alert even if it was already handled (e.g. its PR was closed).
+# By GHSA id; repeatable or comma-separated.
+python dependabot_scan.py --force GHSA-xxxx-yyyy-zzzz
+python dependabot_scan.py --force GHSA-aaaa-bbbb-cccc,GHSA-dddd-eeee-ffff
+
+# Clear all recorded state and reconsider every open alert
+python dependabot_scan.py --reset
 ```
+
+State is keyed by GHSA id in `DEPENDABOT_STATE_FILE`, so a handled alert is never
+re-dispatched automatically — closing its PR does not trigger a new session. Use
+`--force <ghsa>` to re-dispatch specific alerts, or `--reset` to start fresh.
+(`--dry-run` never writes or deletes state.)
 
 Because it is run-once, schedule it however you like (cron, CI on a schedule,
 `launchd`, etc.) — no long-running server required.
