@@ -135,6 +135,8 @@ dispatched Devin session opens the fix PR in the affected repository itself
 
 - `SCAN_REPO` — repo to scan (default `maidang111/superset`)
 - `MAX_DISPATCH` — safety cap on sessions opened per run, highest-severity first (default `5`)
+- `MAX_CASCADE` — if an upgrade cascades to more than this many other packages, Devin flags
+  the PR for human review instead of auto-fixing (default `2`)
 - `SENSITIVE_PACKAGES` — comma-separated high-blast-radius packages that always get a
   reviewed Devin upgrade and bypass the Dependabot-PR dedup (e.g. `sqlalchemy,react,@babel/core`)
 - `DEPENDABOT_STATE_FILE` — path to the idempotency state file

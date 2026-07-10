@@ -35,6 +35,9 @@ SCAN_REPO = os.getenv("SCAN_REPO", "maidang111/superset")
 STATE_FILE = os.getenv("DEPENDABOT_STATE_FILE", ".dependabot_state.json")
 # Safety cap on how many sessions a single run may open.
 MAX_DISPATCH = int(os.getenv("MAX_DISPATCH", "5"))
+# If an upgrade cascades to (forces version changes in) more than this many OTHER
+# packages, Devin must stop the auto-fix and flag the PR for human review instead.
+MAX_CASCADE = int(os.getenv("MAX_CASCADE", "2"))
 
 # Used to rank alerts so the most severe are dispatched first (not to filter them out).
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
@@ -271,8 +274,13 @@ Task (careful-review upgrade -- do NOT blindly bump):
    {cat['patched_version']} itself is that major version. If {cat['patched_version']} is
    not installable, choose the SMALLEST released version that is >= {cat['patched_version']}
    and satisfies the advisory, and call out in the PR why.
-4. Run the full test suite and linters; do not paper over failures.
-5. Open a pull request against the default branch of {repo} that references {cat['ghsa_id']},
+4. Cascade check: determine how many OTHER packages this upgrade forces to change
+   version (transitive/peer dependency bumps beyond {cat['package']} itself). If it
+   cascades to MORE than {MAX_CASCADE} other packages, STOP -- do not silently proceed.
+   Open the PR as a draft flagged for human review, list every cascaded package and the
+   reason, and do not merge.
+5. Run the full test suite and linters; do not paper over failures.
+6. Open a pull request against the default branch of {repo} that references {cat['ghsa_id']},
    explains the blast-radius findings and breaking changes, and explicitly requests
    human review before merge. Do not auto-merge.
 
@@ -290,9 +298,14 @@ Task:
    {cat['patched_version']}, and do NOT cross a major version unless {cat['patched_version']}
    itself is that major version. If {cat['patched_version']} is not installable, use the
    SMALLEST released version that is >= {cat['patched_version']} and satisfies the advisory.
-2. Resolve any breaking changes the upgrade introduces so the project still builds.
-3. Run the project's test suite / linters and make sure they pass.
-4. Open a pull request against the default branch of {repo} with a clear description that
+2. Cascade check: determine how many OTHER packages this upgrade forces to change
+   version (transitive/peer dependency bumps beyond {cat['package']} itself). If it
+   cascades to MORE than {MAX_CASCADE} other packages, STOP -- do not silently proceed.
+   Open the PR as a draft flagged for human review, list every cascaded package and the
+   reason, and do not merge.
+3. Resolve any breaking changes the upgrade introduces so the project still builds.
+4. Run the project's test suite / linters and make sure they pass.
+5. Open a pull request against the default branch of {repo} with a clear description that
    references {cat['ghsa_id']}.
 
 Only touch what is needed to remediate this advisory.
