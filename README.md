@@ -134,6 +134,20 @@ dispatched Devin session opens the fix PR in the affected repository itself
 8. **Idempotency:** every dispatched alert is recorded in
    `DEPENDABOT_STATE_FILE` (keyed by GHSA id), so re-running never double-dispatches.
 
+### Prompt templates
+
+The Devin prompt text is not hard-coded — it lives in `templates/` and is filled at
+dispatch time via `build_prompt()`:
+
+- `routine_upgrade.md` — clean minimal-bump prompt.
+- `reviewed_upgrade.md` — careful-review prompt for sensitive / cascade-escalated alerts.
+- `vulnerability_details.md` — the shared advisory block embedded in both.
+
+Placeholders use `{name}` (e.g. `{package}`, `{patched_version}`, `{max_cascade}`,
+`{label_review}`) and are substituted from the alert's fields plus policy config. Edit the
+`.md` files to tune wording without touching code; point `PROMPT_TEMPLATE_DIR` elsewhere to
+override the location.
+
 ### Configuration (in `.env`)
 
 - `SCAN_REPO` — repo to scan (default `maidang111/superset`)
@@ -166,11 +180,59 @@ python dependabot_scan.py --force GHSA-aaaa-bbbb-cccc,GHSA-dddd-eeee-ffff
 
 # Clear all recorded state and reconsider every open alert
 python dependabot_scan.py --reset
+
+# Compute the upgrade cascade in the scanner (via the GitHub dependency-graph
+# compare API) and escalate wide bumps to a reviewed upgrade
+python dependabot_scan.py --check
 ```
+
+`--check` measures the real transitive cascade of each Dependabot bump (comparing
+the PR branch's dependency graph against the base) instead of leaving that to the
+Devin session. If a bump forces changes to more than `MAX_CASCADE` other packages,
+the alert is escalated to the careful-review path (`rem:needs-careful-review` label
++ review prompt) even if Dependabot already opened a PR. Cascade is only measurable
+for alerts that have an open Dependabot PR (that branch is the compare head).
 
 State is keyed by GHSA id in `DEPENDABOT_STATE_FILE`, so a handled alert is never
 re-dispatched automatically — closing its PR does not trigger a new session. Use
 `--force <ghsa>` to re-dispatch specific alerts, or `--reset` to start fresh.
+
+## Reconciling dispatched sessions
+
+Dispatch is fire-and-forget; `--reconcile` is the companion run-once pass that watches
+each recorded session through to a terminal state:
+
+```bash
+python dependabot_scan.py --reconcile            # advance every recorded session
+python dependabot_scan.py --reconcile --dry-run  # report only; no messages/issues/state writes
+```
+
+For each recorded alert it polls the Devin session, discovers the fix PR (preferring the
+PR URL in the session output, falling back to searching the repo's PRs for the GHSA id —
+the matched method is stored as `pr_discovery_method` for debugging), reads the PR's labels,
+and aggregates its CI check-runs.
+
+**In scope:** creating/nudging Devin sessions, posting session messages, applying labels,
+filing tracking issues, and — when a fix fails (red CI, or a stalled session that did open
+a PR) — attaching the failed session's log to the PR as a comment so a reviewer sees why.
+**Out of scope:** merging PRs — the human-merge gate is deliberate policy, so reconcile
+never touches mainline. (The log is de-duped per retry attempt to avoid spamming; on
+escalation without a PR the log goes into the tracking issue instead.)
+
+### State machine (every entry ends terminal)
+
+```
+dispatched ──PR found──> pr_open ──CI green──> verified        (terminal)
+    │                        │
+    │                        └──CI red──> retrying(n) ──n>MAX_RETRIES──> escalated (terminal)
+    └──session finished, no PR──> no_pr_stalled ──n>MAX_RETRIES──> escalated (terminal)
+```
+
+`retrying`/`no_pr_stalled` nudge the session (a follow-up message) and are bounded by
+`MAX_RETRIES` (default 2); once exhausted the alert is `escalated` — a tracking issue is
+filed and it's left for a human. **Invariant:** every state entry eventually reaches a
+terminal state (`verified` or `escalated`); the retry counter guarantees the loop closes.
+This is enforced by an assertion at the end of the reconcile pass.
 (`--dry-run` never writes or deletes state.)
 
 Because it is run-once, schedule it however you like (cron, CI on a schedule,
