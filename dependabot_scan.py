@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -80,6 +81,77 @@ def fetch_open_alerts(repo):
         url = response.links.get("next", {}).get("url")
         params = None
     return alerts
+
+
+def fetch_open_dependabot_prs(repo):
+    """Return open PRs opened by Dependabot as ``[{"title", "head_ref"}, ...]``.
+
+    Used to skip alerts Dependabot is already fixing on its own (the trivial,
+    patch-available bumps), so Devin is not dispatched to duplicate that work.
+    Returns ``[]`` on any fetch error so a failure here never blocks scanning.
+    """
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    prs = []
+    page = 1
+    try:
+        while True:
+            response = requests.get(
+                f"{GITHUB_API}/repos/{repo}/pulls",
+                headers=headers,
+                params={"state": "open", "per_page": 100, "page": page},
+            )
+            if response.status_code != 200:
+                print(
+                    f"WARN  could not list PRs for dedup ({response.status_code}); "
+                    "proceeding without Dependabot-PR dedup"
+                )
+                return []
+            batch = response.json()
+            if not batch:
+                break
+            for pr in batch:
+                login = (pr.get("user") or {}).get("login", "")
+                if login in ("dependabot[bot]", "dependabot-preview[bot]"):
+                    prs.append(
+                        {
+                            "title": pr.get("title", ""),
+                            "head_ref": (pr.get("head") or {}).get("ref", ""),
+                        }
+                    )
+            if len(batch) < 100:
+                break
+            page += 1
+    except requests.RequestException as exc:
+        print(f"WARN  could not list PRs for dedup ({exc}); proceeding without dedup")
+        return []
+    return prs
+
+
+def _normalize_package(name):
+    """Lowercase and drop a leading npm scope ``@`` for matching."""
+    return (name or "").lower().lstrip("@")
+
+
+def has_open_dependabot_pr(cat, dep_prs):
+    """True if an open Dependabot PR already bumps this alert's package.
+
+    Matches the package name as a delimited token in either the PR title
+    ("Bump <pkg> from ...") or the branch ref ("dependabot/<eco>/.../<pkg>-<ver>"),
+    so scoped names like ``@babel/traverse`` match without false positives on
+    packages that merely share a prefix.
+    """
+    pkg = _normalize_package(cat["package"])
+    if not pkg:
+        return False
+    pattern = re.compile(rf"(^|[\s/@]){re.escape(pkg)}([\s\-/@]|$)")
+    for pr in dep_prs:
+        if pattern.search(pr["title"].lower()) or pattern.search(pr["head_ref"].lower()):
+            return True
+    return False
 
 
 def categorize_alert(alert):
@@ -215,6 +287,12 @@ def main():
 
     state = load_state()
 
+    # Dependabot auto-opens PRs for the trivial patch-available bumps; skip those so
+    # Devin only handles what Dependabot can't (breaking/major bumps, no clean patch).
+    dep_prs = fetch_open_dependabot_prs(repo)
+    if dep_prs:
+        print(f"Found {len(dep_prs)} open Dependabot PR(s); will skip alerts they already cover.")
+
     # Categorize everything, then decide. Non-dispatch outcomes are reported up front.
     candidates = []
     for alert in alerts:
@@ -229,6 +307,10 @@ def main():
         dispatch, reason = should_dispatch(cat)
         if not dispatch:
             print(f"SKIP  {label}: {reason}")
+            continue
+
+        if has_open_dependabot_pr(cat, dep_prs):
+            print(f"SKIP  {label}: Dependabot already has an open PR for this package")
             continue
 
         candidates.append((cat, key, label))
