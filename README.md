@@ -113,18 +113,35 @@ dispatched Devin session opens the fix PR in the affected repository itself
    advisory on a widely-used dependency still matters, and a medium is often a
    trivial bump worth doing). Any alert that has a patched version is dispatched;
    only alerts with **no** patched version are skipped (a bump can't fix those).
-4. **Prioritize** via `priority()`: dispatch order is sorted by severity
+4. **Dedup with Dependabot:** if Dependabot already has an open PR bumping the
+   package, the alert is skipped (`SKIP … Dependabot already has an open PR`) so
+   Devin doesn't duplicate the trivial fix — **unless** the package is
+   policy-sensitive (see below).
+5. **Sensitive packages:** packages listed in `SENSITIVE_PACKAGES` are treated as
+   high-blast-radius. They are **never** skipped by the dedup step and are routed to
+   a *reviewed* Devin upgrade (a careful-review prompt: audit call sites, read the
+   changelog, adapt breakage, request human review — no auto-merge), even when a
+   Dependabot PR exists:
+   `DISPATCH [sensitive] sqlalchemy: Dependabot PR exists but package is policy-sensitive; routing to reviewed upgrade.`
+6. **Prioritize** via `priority()`: dispatch order is sorted by severity
    (critical → low), then runtime-before-dev at equal severity, so the most
    important alerts win the `MAX_DISPATCH` budget.
-5. **Dispatch** the selected alerts to Devin with a structured prompt; the session
-   performs the upgrade, fixes any breakage, runs tests, and opens the PR.
-6. **Idempotency:** every dispatched alert is recorded in
+7. **Dispatch** the selected alerts to Devin with a structured prompt; the session
+   performs the upgrade, fixes any breakage, runs tests, and opens the PR. Each PR is
+   labeled `rem:routine-bump` (clean minimal bump) or `rem:needs-careful-review`
+   (sensitive package, cascade over `MAX_CASCADE`, or non-trivial breaking changes) so
+   humans can triage at a glance.
+8. **Idempotency:** every dispatched alert is recorded in
    `DEPENDABOT_STATE_FILE` (keyed by GHSA id), so re-running never double-dispatches.
 
 ### Configuration (in `.env`)
 
 - `SCAN_REPO` — repo to scan (default `maidang111/superset`)
 - `MAX_DISPATCH` — safety cap on sessions opened per run, highest-severity first (default `5`)
+- `MAX_CASCADE` — if an upgrade cascades to more than this many other packages, Devin flags
+  the PR for human review instead of auto-fixing (default `2`)
+- `SENSITIVE_PACKAGES` — comma-separated high-blast-radius packages that always get a
+  reviewed Devin upgrade and bypass the Dependabot-PR dedup (e.g. `sqlalchemy,react,@babel/core`)
 - `DEPENDABOT_STATE_FILE` — path to the idempotency state file
 - Also requires `GITHUB_TOKEN` (with `security_events`/`repo` scope) and `DEVIN_API_KEY`
 
@@ -139,7 +156,20 @@ python dependabot_scan.py
 
 # Override the repo for a single run
 python dependabot_scan.py --repo owner/name
+
+# Re-dispatch a specific alert even if it was already handled (e.g. its PR was closed).
+# By GHSA id; repeatable or comma-separated.
+python dependabot_scan.py --force GHSA-xxxx-yyyy-zzzz
+python dependabot_scan.py --force GHSA-aaaa-bbbb-cccc,GHSA-dddd-eeee-ffff
+
+# Clear all recorded state and reconsider every open alert
+python dependabot_scan.py --reset
 ```
+
+State is keyed by GHSA id in `DEPENDABOT_STATE_FILE`, so a handled alert is never
+re-dispatched automatically — closing its PR does not trigger a new session. Use
+`--force <ghsa>` to re-dispatch specific alerts, or `--reset` to start fresh.
+(`--dry-run` never writes or deletes state.)
 
 Because it is run-once, schedule it however you like (cron, CI on a schedule,
 `launchd`, etc.) — no long-running server required.

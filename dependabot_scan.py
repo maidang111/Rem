@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -34,11 +35,28 @@ SCAN_REPO = os.getenv("SCAN_REPO", "maidang111/superset")
 STATE_FILE = os.getenv("DEPENDABOT_STATE_FILE", ".dependabot_state.json")
 # Safety cap on how many sessions a single run may open.
 MAX_DISPATCH = int(os.getenv("MAX_DISPATCH", "5"))
+# If an upgrade cascades to (forces version changes in) more than this many OTHER
+# packages, Devin must stop the auto-fix and flag the PR for human review instead.
+MAX_CASCADE = int(os.getenv("MAX_CASCADE", "2"))
+
+# Labels the Devin session applies to the fix PR so humans can triage at a glance.
+LABEL_ROUTINE = "rem:routine-bump"
+LABEL_REVIEW = "rem:needs-careful-review"
 
 # Used to rank alerts so the most severe are dispatched first (not to filter them out).
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 # Runtime dependencies ship in the codebase, so they outrank dev-only ones at equal severity.
 SCOPE_ORDER = {"development": 0}  # everything else (runtime / unknown) ranks higher
+
+# Packages considered high-blast-radius / system-wide. An unreviewed insta-bump of
+# these is risky, so they are ALWAYS routed to a reviewed Devin upgrade -- even when
+# Dependabot already opened a PR (i.e. they bypass the dedup skip). Comma-separated,
+# case-insensitive, leading npm scope "@" ignored (e.g. "sqlalchemy,react,@babel/core").
+SENSITIVE_PACKAGES = {
+    p.strip().lower().lstrip("@")
+    for p in os.getenv("SENSITIVE_PACKAGES", "").split(",")
+    if p.strip()
+}
 
 
 def require_config():
@@ -80,6 +98,82 @@ def fetch_open_alerts(repo):
         url = response.links.get("next", {}).get("url")
         params = None
     return alerts
+
+
+def fetch_open_dependabot_prs(repo):
+    """Return open PRs opened by Dependabot as ``[{"title", "head_ref"}, ...]``.
+
+    Used to skip alerts Dependabot is already fixing on its own (the trivial,
+    patch-available bumps), so Devin is not dispatched to duplicate that work.
+    Returns ``[]`` on any fetch error so a failure here never blocks scanning.
+    """
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    prs = []
+    page = 1
+    try:
+        while True:
+            response = requests.get(
+                f"{GITHUB_API}/repos/{repo}/pulls",
+                headers=headers,
+                params={"state": "open", "per_page": 100, "page": page},
+            )
+            if response.status_code != 200:
+                print(
+                    f"WARN  could not list PRs for dedup ({response.status_code}); "
+                    "proceeding without Dependabot-PR dedup"
+                )
+                return []
+            batch = response.json()
+            if not batch:
+                break
+            for pr in batch:
+                login = (pr.get("user") or {}).get("login", "")
+                if login in ("dependabot[bot]", "dependabot-preview[bot]"):
+                    prs.append(
+                        {
+                            "title": pr.get("title", ""),
+                            "head_ref": (pr.get("head") or {}).get("ref", ""),
+                        }
+                    )
+            if len(batch) < 100:
+                break
+            page += 1
+    except requests.RequestException as exc:
+        print(f"WARN  could not list PRs for dedup ({exc}); proceeding without dedup")
+        return []
+    return prs
+
+
+def _normalize_package(name):
+    """Lowercase and drop a leading npm scope ``@`` for matching."""
+    return (name or "").lower().lstrip("@")
+
+
+def has_open_dependabot_pr(cat, dep_prs):
+    """True if an open Dependabot PR already bumps this alert's package.
+
+    Matches the package name as a delimited token in either the PR title
+    ("Bump <pkg> from ...") or the branch ref ("dependabot/<eco>/.../<pkg>-<ver>"),
+    so scoped names like ``@babel/traverse`` match without false positives on
+    packages that merely share a prefix.
+    """
+    pkg = _normalize_package(cat["package"])
+    if not pkg:
+        return False
+    pattern = re.compile(rf"(^|[\s/@]){re.escape(pkg)}([\s\-/@]|$)")
+    for pr in dep_prs:
+        if pattern.search(pr["title"].lower()) or pattern.search(pr["head_ref"].lower()):
+            return True
+    return False
+
+
+def is_sensitive(cat):
+    """True if the alert's package is on the policy-sensitive (high-blast-radius) list."""
+    return _normalize_package(cat["package"]) in SENSITIVE_PACKAGES
 
 
 def categorize_alert(alert):
@@ -154,26 +248,73 @@ def state_key(repo, cat):
     return f"{repo}#{cat['ghsa_id'] or cat['number']}"
 
 
-def build_prompt(repo, cat):
-    return f"""A Dependabot security alert needs to be fixed in the {repo} repository.
-
-Vulnerability:
+def build_prompt(repo, cat, review=False):
+    details = f"""Vulnerability:
 - Package: {cat['package']} ({cat['ecosystem']})
 - Severity: {cat['severity']}
 - Advisory (GHSA): {cat['ghsa_id']} - {cat['summary']}
 - Vulnerable range: {cat['vulnerable_range']}
 - First patched version: {cat['patched_version']}
 - Manifest file: {cat['manifest_path']}
-- Alert: {cat['url']}
+- Alert: {cat['url']}"""
+
+    if review:
+        return f"""A Dependabot security alert affects {cat['package']}, which is a
+policy-sensitive, high-blast-radius dependency in the {repo} repository. It is used
+in many places, so a blind version bump is risky and must be carefully reviewed.
+
+{details}
+
+Task (careful-review upgrade -- do NOT blindly bump):
+1. First audit the blast radius: find everywhere {cat['package']} is imported/used across
+   {repo} and summarize the surface area that could be affected by the upgrade.
+2. Read the upstream changelog/release notes between the current version and
+   {cat['patched_version']}; list any breaking changes or deprecations that touch how this
+   repo uses the package.
+3. Upgrade {cat['package']} to EXACTLY {cat['patched_version']} -- the first patched
+   version -- in {cat['manifest_path']} and any lockfile, then adapt every affected call
+   site. This is a minimal-bump policy: do NOT upgrade to the latest release or to any
+   version higher than {cat['patched_version']}, and do NOT cross a major version unless
+   {cat['patched_version']} itself is that major version. If {cat['patched_version']} is
+   not installable, choose the SMALLEST released version that is >= {cat['patched_version']}
+   and satisfies the advisory, and call out in the PR why.
+4. Cascade check: determine how many OTHER packages this upgrade forces to change
+   version (transitive/peer dependency bumps beyond {cat['package']} itself). If it
+   cascades to MORE than {MAX_CASCADE} other packages, STOP -- do not silently proceed.
+   Open the PR as a draft flagged for human review, list every cascaded package and the
+   reason, and do not merge.
+5. Run the full test suite and linters; do not paper over failures.
+6. Open a pull request against the default branch of {repo} that references {cat['ghsa_id']},
+   explains the blast-radius findings and breaking changes, and explicitly requests
+   human review before merge. Do not auto-merge. Apply the label `{LABEL_REVIEW}` to the PR
+   (create the label in {repo} if it does not already exist).
+
+Only touch what is needed to remediate this advisory and adapt to the upgrade.
+"""
+
+    return f"""A Dependabot security alert needs to be fixed in the {repo} repository.
+
+{details}
 
 Task:
-1. In the {repo} repository, upgrade {cat['package']} to {cat['patched_version']} (or the
-   nearest safe version that satisfies the advisory) in {cat['manifest_path']} and any
-   lockfile.
-2. Resolve any breaking changes the upgrade introduces so the project still builds.
-3. Run the project's test suite / linters and make sure they pass.
-4. Open a pull request against the default branch of {repo} with a clear description that
-   references {cat['ghsa_id']}.
+1. In the {repo} repository, upgrade {cat['package']} to EXACTLY {cat['patched_version']}
+   -- the first patched version -- in {cat['manifest_path']} and any lockfile. This is a
+   minimal-bump policy: do NOT upgrade to the latest release or to any version higher than
+   {cat['patched_version']}, and do NOT cross a major version unless {cat['patched_version']}
+   itself is that major version. If {cat['patched_version']} is not installable, use the
+   SMALLEST released version that is >= {cat['patched_version']} and satisfies the advisory.
+2. Cascade check: determine how many OTHER packages this upgrade forces to change
+   version (transitive/peer dependency bumps beyond {cat['package']} itself). If it
+   cascades to MORE than {MAX_CASCADE} other packages, STOP -- do not silently proceed.
+   Open the PR as a draft flagged for human review, list every cascaded package and the
+   reason, and do not merge.
+3. Resolve any breaking changes the upgrade introduces so the project still builds.
+4. Run the project's test suite / linters and make sure they pass.
+5. Open a pull request against the default branch of {repo} with a clear description that
+   references {cat['ghsa_id']}. Label the PR (create the label in {repo} if it does not
+   already exist): use `{LABEL_ROUTINE}` for a clean minimal bump; but if the cascade check
+   tripped, or the upgrade required non-trivial code changes to resolve breaking changes,
+   use `{LABEL_REVIEW}` instead and request human review before merge.
 
 Only touch what is needed to remediate this advisory.
 """
@@ -204,16 +345,49 @@ def main():
         help="Print categorization and decisions without creating Devin sessions.",
     )
     parser.add_argument("--repo", default=SCAN_REPO, help=f"Repo to scan (default: {SCAN_REPO}).")
+    parser.add_argument(
+        "--force",
+        action="append",
+        default=[],
+        metavar="GHSA_ID",
+        help=("Re-dispatch this alert even if it is already recorded in state "
+              "(e.g. its PR was closed). Repeatable or comma-separated."),
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Clear all recorded state before scanning, so every open alert is reconsidered.",
+    )
     args = parser.parse_args()
 
     require_config()
+
+    # Normalize --force values (accept repeated flags and comma-separated lists).
+    forced = {
+        g.strip().lower()
+        for item in args.force
+        for g in item.split(",")
+        if g.strip()
+    }
 
     repo = args.repo
     print(f"Scanning open Dependabot alerts for {repo} ...")
     alerts = fetch_open_alerts(repo)
     print(f"Found {len(alerts)} open alert(s).")
 
-    state = load_state()
+    if args.reset:
+        state = {}
+        if not args.dry_run and os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+        print("Reset: ignoring existing state; every open alert will be reconsidered.")
+    else:
+        state = load_state()
+
+    # Dependabot auto-opens PRs for the trivial patch-available bumps; skip those so
+    # Devin only handles what Dependabot can't (breaking/major bumps, no clean patch).
+    dep_prs = fetch_open_dependabot_prs(repo)
+    if dep_prs:
+        print(f"Found {len(dep_prs)} open Dependabot PR(s); will skip alerts they already cover.")
 
     # Categorize everything, then decide. Non-dispatch outcomes are reported up front.
     candidates = []
@@ -222,38 +396,64 @@ def main():
         key = state_key(repo, cat)
         label = f"[{cat['severity']}] {cat['package']} ({cat['ghsa_id']})"
 
-        if key in state:
+        is_forced = (cat["ghsa_id"] or "").lower() in forced
+        if key in state and not is_forced:
             print(f"SKIP  {label}: already handled ({state[key].get('session_url', 'no url')})")
             continue
+        if key in state and is_forced:
+            print(f"FORCE {label}: re-dispatching (was already handled)")
 
         dispatch, reason = should_dispatch(cat)
         if not dispatch:
             print(f"SKIP  {label}: {reason}")
             continue
 
-        candidates.append((cat, key, label))
+        sensitive = is_sensitive(cat)
+        has_dep_pr = has_open_dependabot_pr(cat, dep_prs)
+
+        # Non-sensitive packages Dependabot is already bumping are left to Dependabot.
+        # Sensitive packages are never skipped -- they always get a reviewed upgrade,
+        # even when a Dependabot PR exists, because an unreviewed insta-bump is risky.
+        if has_dep_pr and not sensitive:
+            print(f"SKIP  {label}: Dependabot already has an open PR for this package")
+            continue
+
+        if sensitive:
+            tag = f"[sensitive] {cat['package']}"
+            if has_dep_pr:
+                print(
+                    f"DISPATCH {tag}: Dependabot PR exists but package is policy-sensitive; "
+                    "routing to reviewed upgrade."
+                )
+            else:
+                print(f"DISPATCH {tag}: policy-sensitive package; routing to reviewed upgrade.")
+
+        candidates.append((cat, key, label, sensitive))
 
     # Sort by priority (severity, then runtime-over-dev) so the most important go first.
     candidates.sort(key=lambda c: priority(c[0]), reverse=True)
 
     dispatched = 0
-    for cat, key, label in candidates:
+    for cat, key, label, review in candidates:
+        label = f"[sensitive]{label}" if review else label
         if dispatched >= MAX_DISPATCH:
             print(f"HOLD  {label}: MAX_DISPATCH={MAX_DISPATCH} reached, leaving for next run")
             continue
 
         if args.dry_run:
-            print(f"WOULD DISPATCH  {label}")
+            mode = " (reviewed upgrade)" if review else ""
+            print(f"WOULD DISPATCH  {label}{mode}")
             dispatched += 1
             continue
 
         print(f"DISPATCH  {label}")
-        session = dispatch_to_devin(build_prompt(repo, cat))
+        session = dispatch_to_devin(build_prompt(repo, cat, review=review))
         state[key] = {
             "session_id": session.get("session_id"),
             "session_url": session.get("url"),
             "severity": cat["severity"],
             "package": cat["package"],
+            "reviewed_upgrade": review,
             "dispatched_at": datetime.now(timezone.utc).isoformat(),
         }
         save_state(state)
