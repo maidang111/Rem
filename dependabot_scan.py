@@ -41,6 +41,16 @@ SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 # Runtime dependencies ship in the codebase, so they outrank dev-only ones at equal severity.
 SCOPE_ORDER = {"development": 0}  # everything else (runtime / unknown) ranks higher
 
+# Packages considered high-blast-radius / system-wide. An unreviewed insta-bump of
+# these is risky, so they are ALWAYS routed to a reviewed Devin upgrade -- even when
+# Dependabot already opened a PR (i.e. they bypass the dedup skip). Comma-separated,
+# case-insensitive, leading npm scope "@" ignored (e.g. "sqlalchemy,react,@babel/core").
+SENSITIVE_PACKAGES = {
+    p.strip().lower().lstrip("@")
+    for p in os.getenv("SENSITIVE_PACKAGES", "").split(",")
+    if p.strip()
+}
+
 
 def require_config():
     """Fail loudly (instead of a later NoneType error) if credentials are missing."""
@@ -154,6 +164,11 @@ def has_open_dependabot_pr(cat, dep_prs):
     return False
 
 
+def is_sensitive(cat):
+    """True if the alert's package is on the policy-sensitive (high-blast-radius) list."""
+    return _normalize_package(cat["package"]) in SENSITIVE_PACKAGES
+
+
 def categorize_alert(alert):
     """Extract the decision-relevant fields from a raw Dependabot alert."""
     advisory = alert.get("security_advisory", {})
@@ -226,17 +241,43 @@ def state_key(repo, cat):
     return f"{repo}#{cat['ghsa_id'] or cat['number']}"
 
 
-def build_prompt(repo, cat):
-    return f"""A Dependabot security alert needs to be fixed in the {repo} repository.
-
-Vulnerability:
+def build_prompt(repo, cat, review=False):
+    details = f"""Vulnerability:
 - Package: {cat['package']} ({cat['ecosystem']})
 - Severity: {cat['severity']}
 - Advisory (GHSA): {cat['ghsa_id']} - {cat['summary']}
 - Vulnerable range: {cat['vulnerable_range']}
 - First patched version: {cat['patched_version']}
 - Manifest file: {cat['manifest_path']}
-- Alert: {cat['url']}
+- Alert: {cat['url']}"""
+
+    if review:
+        return f"""A Dependabot security alert affects {cat['package']}, which is a
+policy-sensitive, high-blast-radius dependency in the {repo} repository. It is used
+in many places, so a blind version bump is risky and must be carefully reviewed.
+
+{details}
+
+Task (careful-review upgrade -- do NOT blindly bump):
+1. First audit the blast radius: find everywhere {cat['package']} is imported/used across
+   {repo} and summarize the surface area that could be affected by the upgrade.
+2. Read the upstream changelog/release notes between the current version and
+   {cat['patched_version']}; list any breaking changes or deprecations that touch how this
+   repo uses the package.
+3. Upgrade {cat['package']} to {cat['patched_version']} (or the nearest safe version that
+   satisfies the advisory) in {cat['manifest_path']} and any lockfile, then adapt every
+   affected call site.
+4. Run the full test suite and linters; do not paper over failures.
+5. Open a pull request against the default branch of {repo} that references {cat['ghsa_id']},
+   explains the blast-radius findings and breaking changes, and explicitly requests
+   human review before merge. Do not auto-merge.
+
+Only touch what is needed to remediate this advisory and adapt to the upgrade.
+"""
+
+    return f"""A Dependabot security alert needs to be fixed in the {repo} repository.
+
+{details}
 
 Task:
 1. In the {repo} repository, upgrade {cat['package']} to {cat['patched_version']} (or the
@@ -309,33 +350,52 @@ def main():
             print(f"SKIP  {label}: {reason}")
             continue
 
-        if has_open_dependabot_pr(cat, dep_prs):
+        sensitive = is_sensitive(cat)
+        has_dep_pr = has_open_dependabot_pr(cat, dep_prs)
+
+        # Non-sensitive packages Dependabot is already bumping are left to Dependabot.
+        # Sensitive packages are never skipped -- they always get a reviewed upgrade,
+        # even when a Dependabot PR exists, because an unreviewed insta-bump is risky.
+        if has_dep_pr and not sensitive:
             print(f"SKIP  {label}: Dependabot already has an open PR for this package")
             continue
 
-        candidates.append((cat, key, label))
+        if sensitive:
+            tag = f"[sensitive] {cat['package']}"
+            if has_dep_pr:
+                print(
+                    f"DISPATCH {tag}: Dependabot PR exists but package is policy-sensitive; "
+                    "routing to reviewed upgrade."
+                )
+            else:
+                print(f"DISPATCH {tag}: policy-sensitive package; routing to reviewed upgrade.")
+
+        candidates.append((cat, key, label, sensitive))
 
     # Sort by priority (severity, then runtime-over-dev) so the most important go first.
     candidates.sort(key=lambda c: priority(c[0]), reverse=True)
 
     dispatched = 0
-    for cat, key, label in candidates:
+    for cat, key, label, review in candidates:
+        label = f"[sensitive]{label}" if review else label
         if dispatched >= MAX_DISPATCH:
             print(f"HOLD  {label}: MAX_DISPATCH={MAX_DISPATCH} reached, leaving for next run")
             continue
 
         if args.dry_run:
-            print(f"WOULD DISPATCH  {label}")
+            mode = " (reviewed upgrade)" if review else ""
+            print(f"WOULD DISPATCH  {label}{mode}")
             dispatched += 1
             continue
 
         print(f"DISPATCH  {label}")
-        session = dispatch_to_devin(build_prompt(repo, cat))
+        session = dispatch_to_devin(build_prompt(repo, cat, review=review))
         state[key] = {
             "session_id": session.get("session_id"),
             "session_url": session.get("url"),
             "severity": cat["severity"],
             "package": cat["package"],
+            "reviewed_upgrade": review,
             "dispatched_at": datetime.now(timezone.utc).isoformat(),
         }
         save_state(state)
