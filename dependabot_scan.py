@@ -887,26 +887,19 @@ def main():
 
         candidates.append((cat, key, label, review))
 
-    # Sort by priority (severity, then runtime-over-dev) so the most important go first.
-    candidates.sort(key=lambda c: priority(c[0]), reverse=True)
+    queue.append((key, cat, label, review))
 
-    dispatched = 0
-    for cat, key, label, review in candidates:
-        label = f"[review] {label}" if review else label
-        if dispatched >= MAX_DISPATCH:
-            print(f"HOLD  {label}: MAX_DISPATCH={MAX_DISPATCH} reached, leaving for next run")
-            continue
-
-    # Pass 2: rank the queue - highest severity first, direct deps before
-    # transitive - THEN apply the MAX_DISPATCH cut. This guarantees criticals
-    # are never held behind lower-severity alerts that happened to arrive
-    # earlier in the API response.
+    # Rank the queue - highest severity first, direct deps before transitive -
+    # THEN apply the MAX_DISPATCH cut, so criticals are never held behind
+    # lower-severity alerts that arrived earlier in the API response.
     queue.sort(key=lambda item: priority_key(item[1]))
     to_dispatch, held = queue[:MAX_DISPATCH], queue[MAX_DISPATCH:]
 
     dispatched = 0
     failed = 0
-    for key, cat, label in to_dispatch:
+    for key, cat, label, review in to_dispatch:
+        if review:
+            label = f"[review] {label}"
         if args.dry_run:
             mode = " (reviewed upgrade)" if review else ""
             print(f"WOULD DISPATCH  {label}{mode}")
@@ -917,8 +910,7 @@ def main():
         try:
             session = dispatch_to_devin(build_prompt(repo, cat, review=review))
         except Exception as exc:  # noqa: BLE001 - isolate one flaky call from the run
-            # Don't record state, so this alert is retried on the next run, and keep
-            # going so one failure doesn't abort the remaining candidates.
+            failed += 1
             print(f"FAIL  {label}: dispatch failed, will retry next run ({exc})")
             continue
         state[key] = {
@@ -933,15 +925,12 @@ def main():
             "dispatched_at": datetime.now(timezone.utc).isoformat(),
         }
         save_state(state)
-        print(f"DISPATCH  {label} -> {session.get('url')}")
+        print(f"          -> {session.get('url')}")
         dispatched += 1
-        time.sleep(1)  # be gentle with the API
+        time.sleep(1)
 
-    # The held backlog is printed with queue ranks so the log shows the full
-    # prioritized state of the world, not just what ran.
-    for rank, (_key, _cat, label) in enumerate(held, start=MAX_DISPATCH + 1):
+    for rank, (_key, _cat, label, _review) in enumerate(held, start=MAX_DISPATCH + 1):
         print(f"HOLD  {label}: rank {rank} of {len(queue)}, MAX_DISPATCH={MAX_DISPATCH} reached")
-
     verb = "would dispatch" if args.dry_run else "dispatched"
     summary = f"Done. {verb} {dispatched} session(s); {len(held)} held"
     if failed:
