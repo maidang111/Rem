@@ -6,6 +6,12 @@ dispatch policy, and hands the qualifying ones to Devin. Each dispatched Devin
 session is responsible for opening the fix PR in the affected repository itself
 (that is where the vulnerable manifest lives).
 
+Dispatch policy: severity is a PRIORITY, not a filter. Any alert with a
+published patch (and that ships to production) qualifies; alerts are sorted by
+severity (then direct-before-transitive) and MAX_DISPATCH caps how many
+sessions a single run opens. Criticals always go first; the rest of the
+backlog drains at a controlled rate on subsequent runs.
+
 State is tracked in a local JSON file so re-running the script does not create
 duplicate Devin sessions for alerts it already handled.
 
@@ -33,7 +39,14 @@ DEVIN_API_KEY = os.getenv("DEVIN_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 SCAN_REPO = os.getenv("SCAN_REPO", "maidang111/superset")
 STATE_FILE = os.getenv("DEPENDABOT_STATE_FILE", ".dependabot_state.json")
-# Safety cap on how many sessions a single run may open.
+# Minimum severity to dispatch to Devin: low | medium | high | critical.
+# Default is "low": if a patch exists, we patch. Severity orders the queue;
+# it does not gate it. Raise this only if a deployment genuinely needs to
+# suppress low-priority remediation entirely.
+SEVERITY_THRESHOLD = os.getenv("SEVERITY_THRESHOLD", "low").lower()
+# Safety cap on how many sessions a single run may open. This is the real
+# throttle - it rate-limits for Devin session budget and human PR-review
+# bandwidth, not for remediation cost.
 MAX_DISPATCH = int(os.getenv("MAX_DISPATCH", "5"))
 # If an upgrade cascades to (forces version changes in) more than this many OTHER
 # packages, Devin must stop the auto-fix and flag the PR for human review instead.
@@ -43,7 +56,8 @@ MAX_CASCADE = int(os.getenv("MAX_CASCADE", "2"))
 LABEL_ROUTINE = "rem:routine-bump"
 LABEL_REVIEW = "rem:needs-careful-review"
 
-# Used to rank alerts so the most severe are dispatched first (not to filter them out).
+HTTP_TIMEOUT = 30  # seconds; a hung API call should fail, not hang the run
+
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 # Runtime dependencies ship in the codebase, so they outrank dev-only ones at equal severity.
 SCOPE_ORDER = {"development": 0}  # everything else (runtime / unknown) ranks higher
@@ -109,7 +123,7 @@ def fetch_open_alerts(repo):
     url = f"{GITHUB_API}/repos/{repo}/dependabot/alerts"
     params = {"state": "open", "per_page": 100}
     while url:
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
         if response.status_code != 200:
             raise RuntimeError(
                 f"Failed to fetch Dependabot alerts for {repo}: "
@@ -206,10 +220,15 @@ def categorize_alert(alert):
     dependency = alert.get("dependency", {})
     patched = vuln.get("first_patched_version") or {}
 
+    # Prefer the per-package vulnerability severity; it can differ from the
+    # advisory-level score and is the more specific signal. Fall back to the
+    # advisory severity.
+    severity = (vuln.get("severity") or advisory.get("severity") or "low").lower()
+
     return {
         "number": alert.get("number"),
         "ghsa_id": advisory.get("ghsa_id"),
-        "severity": (advisory.get("severity") or "low").lower(),
+        "severity": severity,
         "summary": advisory.get("summary", ""),
         "package": package.get("name"),
         "ecosystem": package.get("ecosystem"),
@@ -217,13 +236,19 @@ def categorize_alert(alert):
         "patched_version": patched.get("identifier"),
         "has_fix": bool(patched.get("identifier")),
         "scope": dependency.get("scope"),  # "runtime" | "development" | None
+        "relationship": dependency.get("relationship"),  # "direct" | "transitive" | None
         "manifest_path": dependency.get("manifest_path"),
         "url": alert.get("html_url"),
     }
 
 
 def should_dispatch(cat):
-    """Decide whether an alert is worth a Devin session.
+    """Decide whether an alert is eligible for a Devin session at all.
+
+    Severity is intentionally NOT a gate here (beyond the optional
+    SEVERITY_THRESHOLD escape hatch) - it is used to rank the queue in
+    ``priority_key``. If a patch exists and the dependency ships to
+    production, the safest state is patched.
 
     Severity is NOT a filter: a low-severity advisory can still matter (e.g. a
     widely-used dependency), and a medium one is often a trivial bump worth doing.
@@ -234,19 +259,25 @@ def should_dispatch(cat):
     Returns (dispatch: bool, reason: str).
     """
     if not cat["has_fix"]:
-        return False, "no patched version available"
+        # No patched version exists yet; a bump cannot resolve it. Flag for a human.
+        return False, "no patched version available - flagged for human review"
+    if cat["scope"] == "development":
+        return False, "dev-only dependency"
+    if SEVERITY_ORDER.get(cat["severity"], 0) < SEVERITY_ORDER[SEVERITY_THRESHOLD]:
+        return False, f"below severity threshold ({cat['severity']} < {SEVERITY_THRESHOLD})"
     return True, "patched version available"
 
 
-def priority(cat):
-    """Sort key (descending) for dispatch order: severity first, then scope.
+def priority_key(cat):
+    """Sort key: highest severity first, direct dependencies before transitive.
 
-    Higher tuples are dispatched first, so within the MAX_DISPATCH budget the
-    most severe and most-impactful (runtime over dev-only) alerts win.
+    Direct deps are the one cheap exposure proxy the API gives us - they are
+    more likely to be invoked by first-party code and their bumps are less
+    likely to break. Real reachability analysis is the roadmap item.
     """
     return (
-        SEVERITY_ORDER.get(cat["severity"], 0),
-        SCOPE_ORDER.get(cat["scope"], 1),
+        -SEVERITY_ORDER.get(cat["severity"], 0),
+        0 if cat["relationship"] == "direct" else 1,
     )
 
 
@@ -266,9 +297,13 @@ def save_state(state):
 
 
 def state_key(repo, cat):
-    """Stable per-alert key so we do not re-dispatch across runs."""
-    return f"{repo}#{cat['ghsa_id'] or cat['number']}"
+    """Stable per-alert key so we do not re-dispatch across runs.
 
+    GHSA id alone is not unique: one advisory can produce multiple alerts
+    (same package in several manifests, or several packages under one GHSA),
+    so the key includes package and manifest path.
+    """
+    return f"{repo}#{cat['ghsa_id'] or cat['number']}#{cat['package']}#{cat['manifest_path']}"
 
 def build_prompt(repo, cat, review=False):
     details = f"""Vulnerability:
@@ -351,6 +386,7 @@ def dispatch_to_devin(prompt):
         f"{DEVIN_API}/sessions",
         headers=headers,
         json={"prompt": prompt, "idempotent": True},
+        timeout=HTTP_TIMEOUT,
     )
     if response.status_code not in (200, 201):
         raise RuntimeError(
@@ -413,6 +449,8 @@ def main():
 
     # Categorize everything, then decide. Non-dispatch outcomes are reported up front.
     candidates = []
+    # Pass 1: categorize everything and split into skips vs. the dispatch queue.
+    queue = []
     for alert in alerts:
         cat = categorize_alert(alert)
         key = state_key(repo, cat)
@@ -462,30 +500,56 @@ def main():
             print(f"HOLD  {label}: MAX_DISPATCH={MAX_DISPATCH} reached, leaving for next run")
             continue
 
+    # Pass 2: rank the queue - highest severity first, direct deps before
+    # transitive - THEN apply the MAX_DISPATCH cut. This guarantees criticals
+    # are never held behind lower-severity alerts that happened to arrive
+    # earlier in the API response.
+    queue.sort(key=lambda item: priority_key(item[1]))
+    to_dispatch, held = queue[:MAX_DISPATCH], queue[MAX_DISPATCH:]
+
+    dispatched = 0
+    failed = 0
+    for key, cat, label in to_dispatch:
         if args.dry_run:
             mode = " (reviewed upgrade)" if review else ""
             print(f"WOULD DISPATCH  {label}{mode}")
             dispatched += 1
             continue
 
-        print(f"DISPATCH  {label}")
-        session = dispatch_to_devin(build_prompt(repo, cat, review=review))
+        try:
+            session = dispatch_to_devin(build_prompt(repo, cat, review=review))
+        except Exception as exc:  # one flaky call must not abort the rest of the run
+            # Deliberately do NOT record state, so this alert retries next run.
+            failed += 1
+            print(f"FAIL  {label}: {exc}")
+            continue
         state[key] = {
             "session_id": session.get("session_id"),
             "session_url": session.get("url"),
             "severity": cat["severity"],
             "package": cat["package"],
             "reviewed_upgrade": review,
+            "manifest_path": cat["manifest_path"],
             "dispatched_at": datetime.now(timezone.utc).isoformat(),
         }
         save_state(state)
-        print(f"          -> session {session.get('url')}")
+        print(f"DISPATCH  {label} -> {session.get('url')}")
         dispatched += 1
         time.sleep(1)  # be gentle with the API
 
-    verb = "would dispatch" if args.dry_run else "dispatched"
-    print(f"Done. {verb} {dispatched} session(s) (highest-severity first).")
+    # The held backlog is printed with queue ranks so the log shows the full
+    # prioritized state of the world, not just what ran.
+    for rank, (_key, _cat, label) in enumerate(held, start=MAX_DISPATCH + 1):
+        print(f"HOLD  {label}: rank {rank} of {len(queue)}, MAX_DISPATCH={MAX_DISPATCH} reached")
 
+    verb = "would dispatch" if args.dry_run else "dispatched"
+    summary = f"Done. {verb} {dispatched} session(s); {len(held)} held"
+    if failed:
+        summary += f"; {failed} FAILED (will retry next run)"
+    print(summary + ".")
+
+    if failed and not args.dry_run:
+        sys.exit(1)  # non-zero exit so a scheduler/CI wrapper can alert on it
 
 if __name__ == "__main__":
     main()
