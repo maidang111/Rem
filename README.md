@@ -109,21 +109,22 @@ dispatched Devin session opens the fix PR in the affected repository itself
 1. Fetch open alerts via `GET /repos/{repo}/dependabot/alerts?state=open`.
 2. **Categorize** each alert by severity, whether a patched version exists, and
    dependency scope (runtime vs development).
-3. **Decide** via `should_dispatch()`:
-   - dispatch when severity ≥ `SEVERITY_THRESHOLD` **and** a patched version exists
-     **and** it is not a dev-only dependency;
-   - skip (and log the reason) otherwise — e.g. below threshold, no patched
-     version yet (flag for a human), or dev-only.
-4. **Dispatch** qualifying alerts to Devin with a structured prompt; the session
+3. **Decide** via `should_dispatch()`: severity is **not** a filter (a low-severity
+   advisory on a widely-used dependency still matters, and a medium is often a
+   trivial bump worth doing). Any alert that has a patched version is dispatched;
+   only alerts with **no** patched version are skipped (a bump can't fix those).
+4. **Prioritize** via `priority()`: dispatch order is sorted by severity
+   (critical → low), then runtime-before-dev at equal severity, so the most
+   important alerts win the `MAX_DISPATCH` budget.
+5. **Dispatch** the selected alerts to Devin with a structured prompt; the session
    performs the upgrade, fixes any breakage, runs tests, and opens the PR.
-5. **Idempotency:** every dispatched alert is recorded in
+6. **Idempotency:** every dispatched alert is recorded in
    `DEPENDABOT_STATE_FILE` (keyed by GHSA id), so re-running never double-dispatches.
 
 ### Configuration (in `.env`)
 
 - `SCAN_REPO` — repo to scan (default `maidang111/superset`)
-- `SEVERITY_THRESHOLD` — minimum severity to dispatch: `low|medium|high|critical` (default `high`)
-- `MAX_DISPATCH` — safety cap on sessions opened per run (default `5`)
+- `MAX_DISPATCH` — safety cap on sessions opened per run, highest-severity first (default `5`)
 - `DEPENDABOT_STATE_FILE` — path to the idempotency state file
 - Also requires `GITHUB_TOKEN` (with `security_events`/`repo` scope) and `DEVIN_API_KEY`
 
