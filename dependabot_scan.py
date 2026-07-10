@@ -305,7 +305,6 @@ def state_key(repo, cat):
     """
     return f"{repo}#{cat['ghsa_id'] or cat['number']}#{cat['package']}#{cat['manifest_path']}"
 
-
 def build_prompt(repo, cat, review=False):
     details = f"""Vulnerability:
 - Package: {cat['package']} ({cat['ecosystem']})
