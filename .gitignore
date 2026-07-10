@@ -1,2 +1,4 @@
 .env
-.env
+.venv/
+.dependabot_state.json
+__pycache__/
