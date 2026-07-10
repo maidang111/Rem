@@ -1,250 +1,205 @@
 import os
 import hmac
 import hashlib
+import logging
 import requests
+from pathlib import Path
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env sitting next to this file, regardless of working directory
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("remedy")
 
 app = Flask(__name__)
 
-# Configuration
+# --- Configuration (validated at boot: fail loudly, not at request time) ---
 DEVIN_API_KEY = os.getenv("DEVIN_API_KEY")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-SUPERSET_REPO = os.getenv("SUPERSET_REPO", "maidang111/superset")
-REMEDY_REPO = os.getenv("REMEDY_REPO", "maidang111/Remedy")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # used by ingest/emit, not this file
+SUPERSET_REPO = os.getenv("SUPERSET_REPO", "maidang111/superset")
+TEMPLATE_DIR = Path(__file__).parent / "templates"
 
-def verify_webhook_signature(payload, signature):
-    """Verify GitHub webhook signature"""
-    if not WEBHOOK_SECRET:
-        return True  # Skip verification if no secret configured
-    
-    hash_algorithm, github_signature = signature.split('=', 1)
-    if hash_algorithm != 'sha256':
-        return False
-    
-    mac = hmac.new(WEBHOOK_SECRET.encode(), msg=payload, digestmod=hashlib.sha256)
-    expected_signature = mac.hexdigest()
-    
-    return hmac.compare_digest(expected_signature, github_signature)
+DISPATCH_LABEL = "Remediate"
 
-def extract_issue_context(webhook_data):
-    """Extract relevant context from GitHub issue webhook"""
-    issue = webhook_data.get('issue', {})
-    repository = webhook_data.get('repository', {})
-    
-    context = {
-        'issue_number': issue.get('number'),
-        'issue_title': issue.get('title'),
-        'issue_body': issue.get('body', ''),
-        'issue_url': issue.get('html_url'),
-        'repo_name': repository.get('full_name'),
-        'repo_url': repository.get('html_url'),
-        'labels': [label['name'] for label in issue.get('labels', [])],
-        'state': issue.get('state'),
-        'user': issue.get('user', {}).get('login')
-    }
-    return context
+_missing = [name for name, val in [
+    ("DEVIN_API_KEY", DEVIN_API_KEY),
+    ("WEBHOOK_SECRET", WEBHOOK_SECRET),
+] if not val]
+if _missing:
+    raise SystemExit(f"Missing required env vars: {', '.join(_missing)} — check .env")
 
-def create_devin_session(issue_context):
-    """Create a Devin session to fix the issue"""
-    print(f"Using API key: {DEVIN_API_KEY[:20]}...")
-    prompt = f"""
-    Fix the following issue from the Superset repository:
-    
-    Issue Title: {issue_context['issue_title']}
-    Issue Body: {issue_context['issue_body']}
-    Issue URL: {issue_context['issue_url']}
-    
-    Please analyze this issue and create a fix. The fix should be implemented in the Remedy repository.
-    Return the complete code changes needed to address this issue.
-    """
-    
-    headers = {
-        "Authorization": f"Bearer {DEVIN_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "prompt": prompt,
-        "idempotent": True
-    }
-    
-    response = requests.post(
-        "https://api.devin.ai/v1/sessions",
-        headers=headers,
-        json=payload
-    )
-    
-    print(f"Devin API response status: {response.status_code}")
-    print(f"Devin API response: {response.text}")
-    
-    if response.status_code != 200:
-        raise Exception(f"Devin API error: {response.status_code} - {response.text}")
-    
-    return response.json()
+if not (TEMPLATE_DIR / "remediation.md").exists():
+    raise SystemExit(f"Missing prompt template: {TEMPLATE_DIR / 'remediation.md'}")
 
-def monitor_devin_session(session_id):
-    """Monitor Devin session until completion or timeout"""
-    headers = {
-        "Authorization": f"Bearer {DEVIN_API_KEY}"
-    }
-    
-    import time
-    max_attempts = 12  # 1 minute max for demo
-    attempt = 0
-    
-    while attempt < max_attempts:
-        response = requests.get(
-            f"https://api.devin.ai/v1/sessions/{session_id}",
-            headers=headers
-        )
-        
-        if response.status_code != 200:
-            raise Exception(f"Devin session check error: {response.status_code}")
-        
-        session_data = response.json()
-        status = session_data.get('status_enum') or session_data.get('status')
-        
-        print(f"Session status: {status}")
-        
-        if status in ['finished', 'blocked', 'completed']:
-            return session_data
-        
-        attempt += 1
-        time.sleep(5)
-    
-    # For demo purposes, return session data even if still running
-    print("Session still running after timeout, proceeding with session URL")
-    return session_data
+# Dedup registry: issue number -> session_id.
+# In-memory (resets on restart); swap for a SQLite lookup to persist.
+_dispatched = {}
 
-def create_github_pr(issue_context, session_data):
-    """Create a PR in the Remedy repository"""
-    # Extract the fix from the session
-    # For now, we'll create a simple PR with the session URL
-    session_url = session_data.get('url', '')
-    
-    pr_title = f"Fix: {issue_context['issue_title']}"
-    pr_body = f"""
-    Automated fix for issue #{issue_context['issue_number']} from {issue_context['repo_name']}
-    
-    Original Issue: {issue_context['issue_url']}
-    
-    This PR was generated by Devin AI. Session URL: {session_url}
-    
-    Issue Context:
-    - Title: {issue_context['issue_title']}
-    - Labels: {', '.join(issue_context['labels'])}
-    """
-    
-    # First, create a new branch
-    branch_name = f"fix/issue-{issue_context['issue_number']}"
-    
-    # Get default branch
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    repo_response = requests.get(
-        f"https://api.github.com/repos/{REMEDY_REPO}",
-        headers=headers
-    )
-    default_branch = repo_response.json().get('default_branch', 'main')
-    
-    # Create branch (simplified - assumes branch exists or we create it)
-    # For a full implementation, we'd need to:
-    # 1. Get the default branch SHA
-    # 2. Create a new branch from that SHA
-    # 3. Make commits to the branch
-    # 4. Create the PR
-    
-    # For this demo, we'll create the PR directly (will fail if branch doesn't exist)
-    pr_payload = {
-        "title": pr_title,
-        "body": pr_body,
-        "head": branch_name,
-        "base": default_branch
-    }
-    
-    pr_response = requests.post(
-        f"https://api.github.com/repos/{REMEDY_REPO}/pulls",
-        headers=headers,
-        json=pr_payload
-    )
-    
-    if pr_response.status_code != 201:
-        raise Exception(f"Failed to create PR: {pr_response.status_code} - {pr_response.text}")
-    
-    return pr_response.json()
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Handle GitHub webhook for issues"""
-    # Verify signature
-    signature = request.headers.get('X-Hub-Signature-256')
-    if signature and not verify_webhook_signature(request.data, signature):
-        return jsonify({"error": "Invalid signature"}), 401
-    
-    # Check if this is an issue event
-    event_type = request.headers.get('X-GitHub-Event')
-    if event_type != 'issues':
-        return jsonify({"message": "Ignoring non-issue event"}), 200
-    
-    webhook_data = request.json
-    
-    # Only process newly opened issues
-    action = webhook_data.get('action')
-    if action != 'opened':
-        return jsonify({"message": "Ignoring non-opened issue"}), 200
-    
-    # Extract issue context
-    issue_context = extract_issue_context(webhook_data)
-    print(f"Processing issue: {issue_context['issue_title']}")
-    
+def verify_webhook_signature(payload: bytes, signature: str) -> bool:
+    """Verify GitHub webhook HMAC signature against the raw request body."""
     try:
-        # Create Devin session
-        session_data = create_devin_session(issue_context)
-        session_id = session_data.get('session_id')
-        print(f"Created Devin session: {session_id}")
-        
-        # Skip monitoring for demo - proceed directly to PR creation
-        print("Skipping session monitoring for demo, proceeding to PR creation")
-        
-        # Create PR with session URL
-        pr_data = create_github_pr(issue_context, session_data)
-        print(f"Created PR: {pr_data.get('html_url')}")
-        
-        return jsonify({
-            "message": "Issue processed successfully",
-            "session_id": session_id,
-            "session_url": session_data.get('url'),
-            "pr_url": pr_data.get('html_url')
-        }), 200
-        
-    except Exception as e:
-        print(f"Error processing issue: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        hash_algorithm, github_signature = signature.split("=", 1)
+    except ValueError:
+        return False
+    if hash_algorithm != "sha256":
+        return False
+    mac = hmac.new(WEBHOOK_SECRET.encode(), msg=payload, digestmod=hashlib.sha256)
+    return hmac.compare_digest(mac.hexdigest(), github_signature)
 
-@app.route('/', methods=['GET'])
+
+def extract_issue_context(webhook_data: dict) -> dict:
+    """Extract relevant context from a GitHub issue webhook payload."""
+    issue = webhook_data.get("issue", {})
+    repository = webhook_data.get("repository", {})
+    return {
+        "issue_number": issue.get("number"),
+        "issue_title": issue.get("title", "(untitled)"),
+        "issue_body": issue.get("body") or "",
+        "issue_url": issue.get("html_url", ""),
+        "repo_name": repository.get("full_name", ""),
+        "labels": [l.get("name", "") for l in issue.get("labels", [])],
+        "state": issue.get("state"),
+        "user": issue.get("user", {}).get("login"),
+    }
+
+
+def load_prompt(template_name: str, **facts) -> str:
+    template = (TEMPLATE_DIR / template_name).read_text()
+    return template.format(**facts)
+
+
+def create_devin_session(issue_context: dict) -> dict:
+    """Dispatch a Devin session. Devin makes the fix and opens the PR."""
+    prompt = load_prompt(
+        "remediation.md",
+        repo=SUPERSET_REPO,
+        issue_title=issue_context["issue_title"],
+        issue_body=issue_context["issue_body"],
+        issue_url=issue_context["issue_url"],
+    )
+
+    resp = requests.post(
+        "https://api.devin.ai/v1/sessions",
+        headers={
+            "Authorization": f"Bearer {DEVIN_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={"prompt": prompt, "idempotent": True},
+        timeout=30,
+    )
+
+    log.info("Devin API response: %s", resp.status_code)
+    if not resp.ok:
+        raise RuntimeError(f"Devin API {resp.status_code}: {resp.text[:300]}")
+
+    data = resp.json()
+    if "session_id" not in data:
+        raise RuntimeError(f"Devin API response missing session_id: {data}")
+    return data
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    """Orchestrator entry point: ordered gates, then dispatch or decline."""
+
+    # Gate 1 — signature. Missing header = reject, always.
+    signature = request.headers.get("X-Hub-Signature-256")
+    if not signature or not verify_webhook_signature(request.data, signature):
+        return jsonify({"error": "Invalid signature"}), 401
+
+    # Gate 2 — event type whitelist.
+    event_type = request.headers.get("X-GitHub-Event", "")
+    if event_type != "issues":
+        log.info("Ignoring event type: %s", event_type)
+        return jsonify({"status": "ignored", "event": event_type}), 200
+
+    webhook_data = request.get_json(silent=True) or {}
+
+    # Gate 3 — action whitelist. 'labeled' = a human promoting an issue.
+    action = webhook_data.get("action", "")
+    if action not in ("opened", "labeled"):
+        log.info("Ignoring action: %s", action)
+        return jsonify({"status": "ignored", "action": action}), 200
+
+    # Gate 4 — payload shape.
+    issue = webhook_data.get("issue")
+    if not issue:
+        log.info("Ignoring payload with no issue object")
+        return jsonify({"status": "ignored", "reason": "no issue payload"}), 200
+
+    issue_context = extract_issue_context(webhook_data)
+    issue_number = issue_context["issue_number"]
+
+    # Gate 5 — routing fork. Only the agent lane dispatches.
+    if DISPATCH_LABEL not in issue_context["labels"]:
+        log.info(
+            "Issue #%s '%s' routed non-agent (labels: %s)",
+            issue_number, issue_context["issue_title"], issue_context["labels"],
+        )
+        # TODO: metrics row -> routed=non-agent
+        return jsonify(
+            {"status": "logged", "route": "non-agent", "issue": issue_number}
+        ), 200
+
+    # Gate 6 — dedup. Webhooks are at-least-once; the handler is idempotent.
+    if issue_number in _dispatched:
+        log.info(
+            "Issue #%s already has session %s — dropping duplicate",
+            issue_number, _dispatched[issue_number],
+        )
+        # TODO: metrics row -> dropped=duplicate
+        return jsonify({
+            "status": "dropped",
+            "reason": "duplicate",
+            "issue": issue_number,
+            "session_id": _dispatched[issue_number],
+        }), 200
+
+    # Gate 7 — dispatch. Devin opens the PR from its session; we return now.
+    log.info("Dispatching issue #%s: %s", issue_number, issue_context["issue_title"])
+    try:
+        session_data = create_devin_session(issue_context)
+        session_id = session_data.get("session_id")
+        _dispatched[issue_number] = session_id
+        log.info("Created Devin session %s for issue #%s", session_id, issue_number)
+        # TODO: metrics row -> dispatched, session_id
+
+        return jsonify({
+            "status": "dispatched",
+            "issue": issue_number,
+            "session_id": session_id,
+            "session_url": session_data.get("url"),
+        }), 200
+
+    except Exception:
+        log.exception("Dispatch failed for issue #%s", issue_number)
+        # TODO: metrics row -> dispatch_failed
+        return jsonify({"error": "dispatch failed", "issue": issue_number}), 500
+
+
+@app.route("/", methods=["GET"])
 def index():
-    """Root endpoint with basic info"""
     return jsonify({
-        "service": "Remedy Webhook Server",
+        "service": "Remedy Webhook Orchestrator",
         "status": "running",
-        "endpoints": {
-            "webhook": "/webhook (POST)",
-            "health": "/health (GET)"
-        }
+        "endpoints": {"webhook": "/webhook (POST)", "health": "/health (GET)"},
     }), 200
 
-@app.route('/health', methods=['GET'])
+
+@app.route("/health", methods=["GET"])
 def health():
-    """Health check endpoint"""
     return jsonify({"status": "healthy"}), 200
 
-if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    log.info("Remedy orchestrator starting on port %s", port)
+    log.info("Dispatch label: %s | Target repo: %s", DISPATCH_LABEL, SUPERSET_REPO)
+    app.run(host="0.0.0.0", port=port, debug=True)

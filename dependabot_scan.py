@@ -32,12 +32,13 @@ DEVIN_API_KEY = os.getenv("DEVIN_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 SCAN_REPO = os.getenv("SCAN_REPO", "maidang111/superset")
 STATE_FILE = os.getenv("DEPENDABOT_STATE_FILE", ".dependabot_state.json")
-# Minimum severity to dispatch to Devin: low | medium | high | critical
-SEVERITY_THRESHOLD = os.getenv("SEVERITY_THRESHOLD", "high").lower()
 # Safety cap on how many sessions a single run may open.
 MAX_DISPATCH = int(os.getenv("MAX_DISPATCH", "5"))
 
+# Used to rank alerts so the most severe are dispatched first (not to filter them out).
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+# Runtime dependencies ship in the codebase, so they outrank dev-only ones at equal severity.
+SCOPE_ORDER = {"development": 0}  # everything else (runtime / unknown) ranks higher
 
 
 def require_config():
@@ -47,11 +48,6 @@ def require_config():
         for name, value in (("DEVIN_API_KEY", DEVIN_API_KEY), ("GITHUB_TOKEN", GITHUB_TOKEN))
         if not value
     ]
-    if SEVERITY_THRESHOLD not in SEVERITY_ORDER:
-        sys.exit(
-            f"Invalid SEVERITY_THRESHOLD={SEVERITY_THRESHOLD!r}; "
-            f"expected one of {list(SEVERITY_ORDER)}"
-        )
     if missing:
         sys.exit(
             "Missing required environment variable(s): "
@@ -113,17 +109,29 @@ def categorize_alert(alert):
 def should_dispatch(cat):
     """Decide whether an alert is worth a Devin session.
 
+    Severity is NOT a filter: a low-severity advisory can still matter (e.g. a
+    widely-used dependency), and a medium one is often a trivial bump worth doing.
+    So any alert with an available patch is dispatched; severity only affects
+    ordering (see ``priority``). We skip only alerts with no patched version,
+    since a bump cannot resolve those.
+
     Returns (dispatch: bool, reason: str).
     """
-    severity_rank = SEVERITY_ORDER.get(cat["severity"], 0)
-    if severity_rank < SEVERITY_ORDER[SEVERITY_THRESHOLD]:
-        return False, f"below severity threshold ({cat['severity']} < {SEVERITY_THRESHOLD})"
     if not cat["has_fix"]:
-        # No patched version exists yet; a bump cannot resolve it. Flag for a human.
         return False, "no patched version available"
-    if cat["scope"] == "development":
-        return False, "dev-only dependency"
-    return True, "qualifies (severity + patched version available)"
+    return True, "patched version available"
+
+
+def priority(cat):
+    """Sort key (descending) for dispatch order: severity first, then scope.
+
+    Higher tuples are dispatched first, so within the MAX_DISPATCH budget the
+    most severe and most-impactful (runtime over dev-only) alerts win.
+    """
+    return (
+        SEVERITY_ORDER.get(cat["severity"], 0),
+        SCOPE_ORDER.get(cat["scope"], 1),
+    )
 
 
 def load_state():
@@ -206,33 +214,40 @@ def main():
     print(f"Found {len(alerts)} open alert(s).")
 
     state = load_state()
-    dispatched = 0
 
+    # Categorize everything, then decide. Non-dispatch outcomes are reported up front.
+    candidates = []
     for alert in alerts:
         cat = categorize_alert(alert)
         key = state_key(repo, cat)
-        dispatch, reason = should_dispatch(cat)
-
         label = f"[{cat['severity']}] {cat['package']} ({cat['ghsa_id']})"
 
         if key in state:
             print(f"SKIP  {label}: already handled ({state[key].get('session_url', 'no url')})")
             continue
 
+        dispatch, reason = should_dispatch(cat)
         if not dispatch:
             print(f"SKIP  {label}: {reason}")
             continue
 
+        candidates.append((cat, key, label))
+
+    # Sort by priority (severity, then runtime-over-dev) so the most important go first.
+    candidates.sort(key=lambda c: priority(c[0]), reverse=True)
+
+    dispatched = 0
+    for cat, key, label in candidates:
         if dispatched >= MAX_DISPATCH:
             print(f"HOLD  {label}: MAX_DISPATCH={MAX_DISPATCH} reached, leaving for next run")
             continue
 
         if args.dry_run:
-            print(f"WOULD DISPATCH  {label}: {reason}")
+            print(f"WOULD DISPATCH  {label}")
             dispatched += 1
             continue
 
-        print(f"DISPATCH  {label}: {reason}")
+        print(f"DISPATCH  {label}")
         session = dispatch_to_devin(build_prompt(repo, cat))
         state[key] = {
             "session_id": session.get("session_id"),
@@ -247,7 +262,7 @@ def main():
         time.sleep(1)  # be gentle with the API
 
     verb = "would dispatch" if args.dry_run else "dispatched"
-    print(f"Done. {verb} {dispatched} session(s).")
+    print(f"Done. {verb} {dispatched} session(s) (highest-severity first).")
 
 
 if __name__ == "__main__":
