@@ -127,7 +127,10 @@ dispatched Devin session opens the fix PR in the affected repository itself
    (critical → low), then runtime-before-dev at equal severity, so the most
    important alerts win the `MAX_DISPATCH` budget.
 7. **Dispatch** the selected alerts to Devin with a structured prompt; the session
-   performs the upgrade, fixes any breakage, runs tests, and opens the PR.
+   performs the upgrade, fixes any breakage, runs tests, and opens the PR. Each PR is
+   labeled `rem:routine-bump` (clean minimal bump) or `rem:needs-careful-review`
+   (sensitive package, cascade over `MAX_CASCADE`, or non-trivial breaking changes) so
+   humans can triage at a glance.
 8. **Idempotency:** every dispatched alert is recorded in
    `DEPENDABOT_STATE_FILE` (keyed by GHSA id), so re-running never double-dispatches.
 

@@ -39,6 +39,10 @@ MAX_DISPATCH = int(os.getenv("MAX_DISPATCH", "5"))
 # packages, Devin must stop the auto-fix and flag the PR for human review instead.
 MAX_CASCADE = int(os.getenv("MAX_CASCADE", "2"))
 
+# Labels the Devin session applies to the fix PR so humans can triage at a glance.
+LABEL_ROUTINE = "rem:routine-bump"
+LABEL_REVIEW = "rem:needs-careful-review"
+
 # Used to rank alerts so the most severe are dispatched first (not to filter them out).
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 # Runtime dependencies ship in the codebase, so they outrank dev-only ones at equal severity.
@@ -282,7 +286,8 @@ Task (careful-review upgrade -- do NOT blindly bump):
 5. Run the full test suite and linters; do not paper over failures.
 6. Open a pull request against the default branch of {repo} that references {cat['ghsa_id']},
    explains the blast-radius findings and breaking changes, and explicitly requests
-   human review before merge. Do not auto-merge.
+   human review before merge. Do not auto-merge. Apply the label `{LABEL_REVIEW}` to the PR
+   (create the label in {repo} if it does not already exist).
 
 Only touch what is needed to remediate this advisory and adapt to the upgrade.
 """
@@ -306,7 +311,10 @@ Task:
 3. Resolve any breaking changes the upgrade introduces so the project still builds.
 4. Run the project's test suite / linters and make sure they pass.
 5. Open a pull request against the default branch of {repo} with a clear description that
-   references {cat['ghsa_id']}.
+   references {cat['ghsa_id']}. Label the PR (create the label in {repo} if it does not
+   already exist): use `{LABEL_ROUTINE}` for a clean minimal bump; but if the cascade check
+   tripped, or the upgrade required non-trivial code changes to resolve breaking changes,
+   use `{LABEL_REVIEW}` instead and request human review before merge.
 
 Only touch what is needed to remediate this advisory.
 """
