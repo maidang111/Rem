@@ -264,9 +264,13 @@ Task (careful-review upgrade -- do NOT blindly bump):
 2. Read the upstream changelog/release notes between the current version and
    {cat['patched_version']}; list any breaking changes or deprecations that touch how this
    repo uses the package.
-3. Upgrade {cat['package']} to {cat['patched_version']} (or the nearest safe version that
-   satisfies the advisory) in {cat['manifest_path']} and any lockfile, then adapt every
-   affected call site.
+3. Upgrade {cat['package']} to EXACTLY {cat['patched_version']} -- the first patched
+   version -- in {cat['manifest_path']} and any lockfile, then adapt every affected call
+   site. This is a minimal-bump policy: do NOT upgrade to the latest release or to any
+   version higher than {cat['patched_version']}, and do NOT cross a major version unless
+   {cat['patched_version']} itself is that major version. If {cat['patched_version']} is
+   not installable, choose the SMALLEST released version that is >= {cat['patched_version']}
+   and satisfies the advisory, and call out in the PR why.
 4. Run the full test suite and linters; do not paper over failures.
 5. Open a pull request against the default branch of {repo} that references {cat['ghsa_id']},
    explains the blast-radius findings and breaking changes, and explicitly requests
@@ -280,9 +284,12 @@ Only touch what is needed to remediate this advisory and adapt to the upgrade.
 {details}
 
 Task:
-1. In the {repo} repository, upgrade {cat['package']} to {cat['patched_version']} (or the
-   nearest safe version that satisfies the advisory) in {cat['manifest_path']} and any
-   lockfile.
+1. In the {repo} repository, upgrade {cat['package']} to EXACTLY {cat['patched_version']}
+   -- the first patched version -- in {cat['manifest_path']} and any lockfile. This is a
+   minimal-bump policy: do NOT upgrade to the latest release or to any version higher than
+   {cat['patched_version']}, and do NOT cross a major version unless {cat['patched_version']}
+   itself is that major version. If {cat['patched_version']} is not installable, use the
+   SMALLEST released version that is >= {cat['patched_version']} and satisfies the advisory.
 2. Resolve any breaking changes the upgrade introduces so the project still builds.
 3. Run the project's test suite / linters and make sure they pass.
 4. Open a pull request against the default branch of {repo} with a clear description that
