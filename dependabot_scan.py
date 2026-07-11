@@ -18,6 +18,8 @@ duplicate Devin sessions for alerts it already handled.
 Usage:
     python dependabot_scan.py            # scan and dispatch
     python dependabot_scan.py --dry-run  # scan and print decisions, dispatch nothing
+    python dependabot_scan.py --check    # compute the cascade, route through reviewed-upgrade path, and Devin ships the fix PR
+    python dependabot_scan.py --reset    # reset the state file
 """
 import argparse
 import json

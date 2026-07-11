@@ -121,7 +121,7 @@ Label an issue `Remediate` and the orchestrator dispatches it.
 - **Per-alert state** — `.dependabot_state.json` records every alert's lifecycle
   (`dispatched` → `pr_open` → `verified`/`escalated`) with session URLs. Re-runs
   are incremental: only net-new alerts spend Devin sessions.
-- **Escalation issues** — when retries are exhausted, Redress files a tracking
+- **Escalation issues** — when retries are exhausted, Rem files a tracking
   issue with the full Devin session log embedded, so the human picking it up
   starts with context instead of archaeology.
 - **PR labels** — `rem:routine-bump` vs `rem:needs-careful-review` make triage
