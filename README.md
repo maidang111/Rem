@@ -112,6 +112,30 @@ ngrok http 5000                            # point the GitHub webhook at /webhoo
 
 Label an issue `Remediate` and the orchestrator dispatches it.
 
+## Project layout
+
+The scanner lives in the `dependabot_scanner/` package (one concern per module):
+
+- `config.py` — env vars, constants, `require_config`, sensitive-package list
+- `github_api.py` — all GitHub REST calls (alerts, PRs, CI, labels, issues)
+- `devin.py` — Devin API client (dispatch/poll/message/log)
+- `policy.py` — categorization + dispatch decision (`should_dispatch`, `priority_key`)
+- `prompts.py` — render Devin prompts from `templates/`
+- `state.py` — the `.dependabot_state.json` idempotency ledger
+- `reconcile.py` — drive dispatched sessions to a terminal state
+- `cli.py` / `__main__.py` — argument parsing + orchestration
+
+`dependabot_scan.py` at the repo root is a thin shim that calls
+`dependabot_scanner.cli.main`, so `python dependabot_scan.py ...` (and
+`python -m dependabot_scanner`) both work unchanged.
+
+### Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest        # unit tests for the pure policy logic (no network)
+```
+
 ## Observability
 - **Run-summary issues** — every scan and reconcile files one issue in this
   repo (label: `rem:run-summary`) with counts (dispatched / held / failed /
