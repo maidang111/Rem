@@ -113,13 +113,15 @@ ngrok http 5000                            # point the GitHub webhook at /webhoo
 Label an issue `Remediate` and the orchestrator dispatches it.
 
 ## Observability
-
+- **Run-summary issues** — every scan and reconcile files one issue in this
+  repo (label: `rem:run-summary`) with counts (dispatched / held / failed /
+  verified / escalated) and one decision bullet per alert: what was dispatched
+  and to whom, what was skipped and why, what was held at the cap. The Issues
+  tab is the dashboard. Runs that do nothing file nothing.
 - **Per-alert state** — `.dependabot_state.json` records every alert's lifecycle
   (`dispatched` → `pr_open` → `verified`/`escalated`) with session URLs. Re-runs
   are incremental: only net-new alerts spend Devin sessions.
-- **Run summaries** — every scan and reconcile prints its ledger:
-  dispatched / held / verified / escalated counts.
-- **Escalation issues** — when retries are exhausted, Rem files a tracking
+- **Escalation issues** — when retries are exhausted, Redress files a tracking
   issue with the full Devin session log embedded, so the human picking it up
   starts with context instead of archaeology.
 - **PR labels** — `rem:routine-bump` vs `rem:needs-careful-review` make triage
@@ -147,8 +149,5 @@ path, and Devin ships the fix PR with the session log attached.
 
 ## Roadmap
 
-- GitHub Actions `schedule` + `workflow_dispatch` trigger for the scanner
-- Run summary filed as a GitHub issue per scan (dashboard-in-an-issue)
-- SQLite-backed state for the webhook dedup registry
 - Devin Review integration: catch vulnerable dependencies at PR time,
   before they ship
