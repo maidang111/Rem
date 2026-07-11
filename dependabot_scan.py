@@ -823,8 +823,6 @@ def main():
     if dep_prs:
         print(f"Found {len(dep_prs)} open Dependabot PR(s); will skip alerts they already cover.")
 
-    # Categorize everything, then decide. Non-dispatch outcomes are reported up front.
-    candidates = []
     # Pass 1: categorize everything and split into skips vs. the dispatch queue.
     queue = []
     for alert in alerts:
@@ -884,10 +882,7 @@ def main():
                 f"DISPATCH [cascade] {cat['package']}: Dependabot PR exists but the bump "
                 f"cascades to more than {MAX_CASCADE} packages; routing to reviewed upgrade."
             )
-
-        candidates.append((cat, key, label, review))
-
-    queue.append((key, cat, label, review))
+        queue.append((key, cat, label, review))
 
     # Rank the queue - highest severity first, direct deps before transitive -
     # THEN apply the MAX_DISPATCH cut, so criticals are never held behind
