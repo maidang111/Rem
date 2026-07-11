@@ -1,4 +1,4 @@
-# Redress
+# Rem
 
 **An agent harness for security remediation.** Rem sits between vulnerability
 detection (Dependabot alerts, GitHub issues) and execution (Devin, Dependabot,
@@ -113,8 +113,6 @@ ngrok http 5000                            # point the GitHub webhook at /webhoo
 Label an issue `Remediate` and the orchestrator dispatches it.
 
 ## Observability
-
-*"If I were an engineering leader, how would I know this is working?"*
 
 - **Per-alert state** — `.dependabot_state.json` records every alert's lifecycle
   (`dispatched` → `pr_open` → `verified`/`escalated`) with session URLs. Re-runs

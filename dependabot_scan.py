@@ -42,6 +42,9 @@ DEVIN_API_KEY = os.getenv("DEVIN_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 SCAN_REPO = os.getenv("SCAN_REPO", "maidang111/superset")
 STATE_FILE = os.getenv("DEPENDABOT_STATE_FILE", ".dependabot_state.json")
+# Where run-summary issues are filed: the orchestrator repo, NOT the scan target,
+# so the ledger lives next to the code that produced it.
+SUMMARY_REPO = os.getenv("SUMMARY_REPO", "maidang111/Rem")
 # Minimum severity to dispatch to Devin: low | medium | high | critical.
 # Default is "low": if a patch exists, we patch. Severity orders the queue;
 # it does not gate it. Raise this only if a deployment genuinely needs to
@@ -664,6 +667,40 @@ def open_tracking_issue(repo, entry, session_log=None):
     return None
 
 
+def file_run_summary(repo, mode, counts, details, dry_run):
+    """File one issue per run in SUMMARY_REPO: the ledger an eng leader reads.
+
+    Counts answer "is it working"; the decision bullets answer "what did it
+    decide". Skipped entirely when the run did nothing, so a scheduled scan
+    with no new alerts does not generate noise.
+    """
+    if not any(counts.values()) and not details:
+        return  # nothing happened; don't file noise
+    title = f"[rem] {mode} run summary — {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC"
+    lines = [f"- **{k}**: {v}" for k, v in sorted(counts.items())]
+    body = (
+        f"## Redress {mode} run — `{repo}`\n\n" + "\n".join(lines)
+        + "\n\n### Decisions\n" + ("\n".join(details) if details else "_none_")
+        + f"\n\n_threshold: `{SEVERITY_THRESHOLD}` · max dispatch: `{MAX_DISPATCH}`_"
+    )
+    if dry_run:
+        print("DRY   would file run summary issue")
+        return
+    try:
+        response = requests.post(
+            f"{GITHUB_API}/repos/{SUMMARY_REPO}/issues",
+            headers=_github_headers(),
+            json={"title": title, "body": body, "labels": ["rem:run-summary"]},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if response.status_code in (200, 201):
+            print(f"SUMMARY filed: {response.json().get('html_url')}")
+        else:
+            print(f"WARN  could not file run summary ({response.status_code})")
+    except requests.RequestException as exc:
+        print(f"WARN  could not file run summary ({exc})")
+
+
 def _bump_retry_or_escalate(repo, entry, label, reason, nudge, session, dry_run):
     """Move a problem entry one step: nudge the session, or escalate at the retry cap.
 
@@ -748,6 +785,13 @@ def reconcile(repo, state, dry_run):
         counts[e["status"]] = counts.get(e["status"], 0) + 1
     print("Reconcile summary: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
 
+    details = [
+        f"- `{e.get('status')}` {e.get('package')} ({e.get('ghsa_id')})"
+        + (f" → {e.get('pr_url')}" if e.get("pr_url") else "")
+        for e in state.values()
+    ]
+    file_run_summary(repo, "reconcile", counts, details, dry_run)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Scan Dependabot alerts and dispatch fixes to Devin.")
@@ -823,8 +867,10 @@ def main():
     if dep_prs:
         print(f"Found {len(dep_prs)} open Dependabot PR(s); will skip alerts they already cover.")
 
+    # Categorize everything, then decide. Non-dispatch outcomes are reported up front.
     # Pass 1: categorize everything and split into skips vs. the dispatch queue.
     queue = []
+    details = []  # one markdown bullet per decision, for the run-summary issue
     for alert in alerts:
         cat = categorize_alert(alert)
         key = state_key(repo, cat)
@@ -833,6 +879,7 @@ def main():
         is_forced = (cat["ghsa_id"] or "").lower() in forced
         if key in state and not is_forced:
             print(f"SKIP  {label}: already handled ({state[key].get('session_url', 'no url')})")
+            details.append(f"- ⏭️ SKIP {label} — already handled")
             continue
         if key in state and is_forced:
             print(f"FORCE {label}: re-dispatching (was already handled)")
@@ -840,6 +887,7 @@ def main():
         dispatch, reason = should_dispatch(cat)
         if not dispatch:
             print(f"SKIP  {label}: {reason}")
+            details.append(f"- ⏭️ SKIP {label} — {reason}")
             continue
 
         sensitive = is_sensitive(cat)
@@ -866,6 +914,7 @@ def main():
         # -- they always get a reviewed upgrade, since an insta-bump is risky.
         if has_dep_pr and not review:
             print(f"SKIP  {label}: Dependabot already has an open PR for this package")
+            details.append(f"- ⏭️ SKIP {label} — Dependabot PR already open")
             continue
 
         if sensitive:
@@ -882,6 +931,7 @@ def main():
                 f"DISPATCH [cascade] {cat['package']}: Dependabot PR exists but the bump "
                 f"cascades to more than {MAX_CASCADE} packages; routing to reviewed upgrade."
             )
+
         queue.append((key, cat, label, review))
 
     # Rank the queue - highest severity first, direct deps before transitive -
@@ -898,6 +948,7 @@ def main():
         if args.dry_run:
             mode = " (reviewed upgrade)" if review else ""
             print(f"WOULD DISPATCH  {label}{mode}")
+            details.append(f"- ✅ would dispatch {label}{mode}")
             dispatched += 1
             continue
 
@@ -907,6 +958,7 @@ def main():
         except Exception as exc:  # noqa: BLE001 - isolate one flaky call from the run
             failed += 1
             print(f"FAIL  {label}: dispatch failed, will retry next run ({exc})")
+            details.append(f"- ❌ FAILED {label} — will retry next run")
             continue
         state[key] = {
             "session_id": session.get("session_id"),
@@ -921,16 +973,24 @@ def main():
         }
         save_state(state)
         print(f"          -> {session.get('url')}")
+        details.append(f"- ✅ dispatched {label} → {session.get('url')}")
         dispatched += 1
         time.sleep(1)
 
     for rank, (_key, _cat, label, _review) in enumerate(held, start=MAX_DISPATCH + 1):
         print(f"HOLD  {label}: rank {rank} of {len(queue)}, MAX_DISPATCH={MAX_DISPATCH} reached")
+        details.append(f"- ⏸️ HOLD {label} — rank {rank}, cap reached")
     verb = "would dispatch" if args.dry_run else "dispatched"
     summary = f"Done. {verb} {dispatched} session(s); {len(held)} held"
     if failed:
         summary += f"; {failed} FAILED (will retry next run)"
     print(summary + ".")
+
+    file_run_summary(
+        repo, "scan",
+        {"dispatched": dispatched, "held": len(held), "failed": failed},
+        details, args.dry_run,
+    )
 
     if failed and not args.dry_run:
         sys.exit(1)  # non-zero exit so a scheduler/CI wrapper can alert on it
