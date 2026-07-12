@@ -10,13 +10,14 @@ Task (careful-review upgrade -- do NOT blindly bump):
 2. Read the upstream changelog/release notes between the current version and
    {patched_version}; list any breaking changes or deprecations that touch how this
    repo uses the package.
-3. Upgrade {package} to EXACTLY {patched_version} -- the first patched
+3. Upgrade {package} to AT LEAST {patched_version} -- the first patched
    version -- in {manifest_path} and any lockfile, then adapt every affected call
-   site. This is a minimal-bump policy: do NOT upgrade to the latest release or to any
-   version higher than {patched_version}, and do NOT cross a major version unless
-   {patched_version} itself is that major version. If {patched_version} is
-   not installable, choose the SMALLEST released version that is >= {patched_version}
-   and satisfies the advisory, and call out in the PR why.
+   site. If the repo's manifests already constrain {package} to a higher compatible
+   version, use that version instead -- prefer consistency with existing constraints.
+   Do NOT downgrade any dependency to reach the target. Otherwise keep the bump minimal:
+   do not upgrade past what is needed for a compatible, patched version, and do not cross
+   a major version unless {patched_version} itself is that major version. Call out in the
+   PR which version you landed on and why.
 4. Cascade check: determine how many OTHER packages this upgrade forces to change
    version (transitive/peer dependency bumps beyond {package} itself). If it
    cascades to MORE than {max_cascade} other packages, STOP -- do not silently proceed.
