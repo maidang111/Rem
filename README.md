@@ -118,6 +118,47 @@ It receives GitHub issue webhooks and walks seven ordered gates:
 7. **Dispatch** — a Devin session is created (`idempotent: true`) from the
    issue's title/body/URL and the session id is recorded.
 
+## Design principles
+
+The decisions the routing and lifecycle above are built on:
+
+- **Cheapest capable owner.** Route each finding to the cheapest owner that
+  can actually fix it — Dependabot (free) → Devin → human. Never spend a Devin
+  session where Dependabot works; never spend a human where Devin suffices.
+- **Capability, not activity.** Delegate to Dependabot on whether it *could*
+  fix an alert (direct dependency, in-major patch, no cascade), predictively —
+  not on whether it has already opened a PR.
+- **Bounded delegation, never rots.** A delegation is a prediction, so it
+  carries a `DEPENDABOT_WAIT_HOURS` deadline; if the predicted PR never appears
+  (or its CI goes red), the reconcile pass promotes the alert to Devin.
+- **Sensitivity and cascade outrank capability.** A sensitive or
+  cascade-escalated package always gets a reviewed Devin upgrade — it is never
+  delegated to Dependabot or skipped as "Dependabot's", even for a trivial bump.
+- **Don't duplicate in-flight work.** An advisory already covered by an open
+  fix PR (any author, matched by GHSA id) is skipped rather than re-dispatched.
+- **Minimum bump, security-justified only.** Upgrade to the *first* patched
+  version (or an existing higher constraint), never downgrade a sibling, no
+  opportunistic jumps to latest — and only vulnerabilities *with* a patch get
+  fixed; hygiene bumps don't.
+- **Major bumps are Devin's lane.** A cross-major patch implies possible API
+  removals — code migration, not a version-number edit Dependabot can make.
+- **Ranks, not gates.** If a patch exists the default is to take it;
+  `SEVERITY_THRESHOLD` is a deployment knob and severity only *orders* the
+  queue (capped by `MAX_DISPATCH`), it doesn't filter it.
+- **Verification is never self-report.** CI is the authority on Devin's fixes
+  and the reconcile loop on Dependabot's follow-through; no owner is trusted on
+  its word, and Rem never merges — merging is a human decision by design.
+- **Conservative on unknowns.** An unreadable manifest, unparsable
+  version/range, or unknown dependency relationship falls through to Devin
+  rather than being silently dropped or wrongly delegated.
+- **Fail-open on infra, fail-toward-action on ambiguity.** A failed PR or
+  cascade fetch degrades dedup but never blocks a scan; an unparsable
+  delegation timestamp promotes to Devin rather than stalling.
+- **Idempotent, state-tracked runs.** Each remediation is keyed
+  `repo#ghsa_id#package` (manifest-independent, so one advisory across several
+  manifests collapses into one session), and re-runs only consider net-new
+  alerts.
+
 ## Setup
 
 ```bash
