@@ -49,7 +49,21 @@ def warn_once(message):
     if message in _SEEN_WARNINGS:
         return
     _SEEN_WARNINGS.add(message)
-    print(f"WARN: {message}")
+    warn_once(f"{message}")
+
+
+# Warnings about transient/environmental conditions (a failed dedup fetch, an
+# unavailable cascade endpoint) can otherwise fire once per alert and bury the
+# actual decisions. Deduplicate identical warning lines so each prints once.
+_SEEN_WARNINGS = set()
+
+
+def warn_once(message):
+    """Print a ``WARN`` line only the first time this exact message is seen."""
+    if message in _SEEN_WARNINGS:
+        return
+    _SEEN_WARNINGS.add(message)
+    warn_once(f"{message}")
 
 # Devin prompt text lives in these template files so it can be edited without code changes.
 TEMPLATE_DIR = Path(os.getenv("PROMPT_TEMPLATE_DIR", Path(__file__).parent / "templates"))
@@ -79,9 +93,16 @@ REQUEST_TIMEOUT = (float(os.getenv("REQUEST_TIMEOUT", "30")), float(os.getenv("R
 # How many times --reconcile nudges a stuck session (no PR, or red CI) before it
 # escalates the alert to a human.
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
+# How long a DELEGATED alert (routed to Dependabot on predicted capability)
+# waits for Dependabot's PR before --reconcile promotes it to a Devin session.
+# Delegation is a prediction, and predictions get deadlines, not trust.
+DEPENDABOT_WAIT_HOURS = float(os.getenv("DEPENDABOT_WAIT_HOURS", "24"))
 
 # Lifecycle of every state entry. The reconcile loop must move each entry toward a
 # TERMINAL_STATE; retrying/no_pr_stalled are bounded by MAX_RETRIES then escalate.
+#   delegated      -> routed to Dependabot (predicted capable); its PR has
+#                     DEPENDABOT_WAIT_HOURS to appear, then it promotes to Devin
+#   dependabot_pr_open -> Dependabot's PR discovered, CI pending; red CI promotes to Devin
 #   dispatched     -> session created, no PR seen yet
 #   pr_open        -> PR discovered, CI still pending/unknown
 #   verified       -> PR open AND CI green                         (terminal, success)
@@ -89,7 +110,10 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
 #   no_pr_stalled  -> session finished without opening a PR; nudged (bounded)
 #   escalated      -> retries exhausted; tracking issue filed      (terminal, needs human)
 TERMINAL_STATES = {"verified", "escalated"}
-KNOWN_STATES = {"dispatched", "pr_open", "verified", "retrying", "no_pr_stalled", "escalated"}
+KNOWN_STATES = {
+    "delegated", "dependabot_pr_open",
+    "dispatched", "pr_open", "verified", "retrying", "no_pr_stalled", "escalated",
+}
 
 # Labels the Devin session applies to the fix PR so humans can triage at a glance.
 LABEL_ROUTINE = "rem:routine-bump"
@@ -176,23 +200,12 @@ def fetch_open_alerts(repo):
     return alerts
 
 
-DEPENDABOT_LOGINS = {"dependabot[bot]", "dependabot-preview[bot]"}
+def fetch_open_dependabot_prs(repo):
+    """Return open PRs opened by Dependabot as ``[{"title", "head_ref"}, ...]``.
 
-
-def fetch_open_fix_prs(repo):
-    """Return every open PR as ``[{"title", "head_ref", "base_ref", "body", "author"}, ...]``.
-
-    Used to skip alerts that are ALREADY being fixed by an open PR, so Devin is
-    not dispatched to duplicate work. That covers two cases:
-      * Dependabot's own trivial patch-available bumps ("Bump <pkg> from ..."), and
-      * a fix PR a prior scan already opened (Devin/human), which references the
-        advisory's GHSA id -- the alert stays open until that PR merges, so
-        without this the next run re-dispatches an alert that's already handled.
-
-    Author-scoped filtering would miss the second case entirely (this system's own
-    PRs are not authored by ``dependabot[bot]``), so we return all open PRs and let
-    ``find_fix_pr`` decide what actually covers a given alert. Returns ``[]`` on any
-    fetch error so a failure here never blocks scanning.
+    Used to skip alerts Dependabot is already fixing on its own (the trivial,
+    patch-available bumps), so Devin is not dispatched to duplicate that work.
+    Returns ``[]`` on any fetch error so a failure here never blocks scanning.
     """
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
@@ -212,26 +225,31 @@ def fetch_open_fix_prs(repo):
             if response.status_code != 200:
                 warn_once(
                     f"could not list PRs for dedup ({response.status_code}); "
-                    "proceeding without open-fix-PR dedup"
+                warn_once(
+                    f"could not list PRs for dedup ({response.status_code}); "
+                    "proceeding without Dependabot-PR dedup"
                 )
                 return []
             batch = response.json()
             if not batch:
                 break
             for pr in batch:
-                prs.append(
-                    {
-                        "title": pr.get("title", ""),
-                        "head_ref": (pr.get("head") or {}).get("ref", ""),
-                        "base_ref": (pr.get("base") or {}).get("ref", ""),
-                        "body": pr.get("body") or "",
-                        "author": (pr.get("user") or {}).get("login", ""),
-                    }
-                )
+                login = (pr.get("user") or {}).get("login", "")
+                if login in ("dependabot[bot]", "dependabot-preview[bot]"):
+                    prs.append(
+                        {
+                            "title": pr.get("title", ""),
+                            "head_ref": (pr.get("head") or {}).get("ref", ""),
+                            "base_ref": (pr.get("base") or {}).get("ref", ""),
+                            "number": pr.get("number"),
+                            "html_url": pr.get("html_url", ""),
+                        }
+                    )
             if len(batch) < 100:
                 break
             page += 1
     except requests.RequestException as exc:
+        warn_once(f"could not list PRs for dedup ({exc}); proceeding without dedup")
         warn_once(f"could not list PRs for dedup ({exc}); proceeding without dedup")
         return []
     return prs
@@ -242,39 +260,27 @@ def _normalize_package(name):
     return (name or "").lower().lstrip("@")
 
 
-def find_fix_pr(cat, prs):
-    """Return an open PR that already remediates this alert, or None.
+def find_dependabot_pr(cat, dep_prs):
+    """Return the open Dependabot PR that bumps this alert's package, or None.
 
-    Two independent, deliberately-narrow signals so we never mistake an unrelated
-    PR for a fix:
-      * GHSA id (any author): the dispatch prompts instruct Devin to reference the
-        advisory's GHSA id in the PR, so a case-insensitive token match on the
-        title/branch/body means this exact advisory is already being fixed.
-      * package name (Dependabot-authored PRs only): Dependabot titles/branches name
-        the package but not the GHSA, so match the package as a delimited token
-        ("Bump <pkg> from ...", "dependabot/<eco>/.../<pkg>-<ver>"). Restricting
-        this to Dependabot avoids false positives on human PRs that merely mention
-        the package.
+    Matches the package name as a delimited token in either the PR title
+    ("Bump <pkg> from ...") or the branch ref ("dependabot/<eco>/.../<pkg>-<ver>"),
+    so scoped names like ``@babel/traverse`` match without false positives on
+    packages that merely share a prefix.
     """
-    ghsa = (cat.get("ghsa_id") or "").lower()
-    ghsa_pattern = re.compile(rf"(^|[^0-9a-z-]){re.escape(ghsa)}([^0-9a-z-]|$)") if ghsa else None
-
     pkg = _normalize_package(cat["package"])
-    pkg_pattern = re.compile(rf"(^|[\s/@]){re.escape(pkg)}([\s\-/@]|$)") if pkg else None
-
-    for pr in prs:
-        haystacks = (pr["title"].lower(), pr["head_ref"].lower(), pr["base_ref"].lower(), pr["body"].lower())
-        if ghsa_pattern and any(ghsa_pattern.search(h) for h in haystacks):
+    if not pkg:
+        return None
+    pattern = re.compile(rf"(^|[\s/@]){re.escape(pkg)}([\s\-/@]|$)")
+    for pr in dep_prs:
+        if pattern.search(pr["title"].lower()) or pattern.search(pr["head_ref"].lower()):
             return pr
-        if pkg_pattern and pr.get("author", "") in DEPENDABOT_LOGINS:
-            if pkg_pattern.search(pr["title"].lower()) or pkg_pattern.search(pr["head_ref"].lower()):
-                return pr
     return None
 
 
-def has_open_fix_pr(cat, prs):
-    """True if an open PR already remediates this alert."""
-    return find_fix_pr(cat, prs) is not None
+def has_open_dependabot_pr(cat, dep_prs):
+    """True if an open Dependabot PR already bumps this alert's package."""
+    return find_dependabot_pr(cat, dep_prs) is not None
 
 
 def cascade_package_count(repo, base, head, cat):
@@ -297,8 +303,10 @@ def cascade_package_count(repo, base, head, cat):
         response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
     except requests.RequestException as exc:
         warn_once(f"cascade check failed ({exc}); not escalating")
+        warn_once(f"cascade check failed ({exc}); not escalating")
         return None
     if response.status_code != 200:
+        warn_once(f"cascade check unavailable ({response.status_code}); not escalating")
         warn_once(f"cascade check unavailable ({response.status_code}); not escalating")
         return None
     target = _normalize_package(cat["package"])
@@ -313,126 +321,99 @@ def is_sensitive(cat):
     return _normalize_package(cat["package"]) in SENSITIVE_PACKAGES
 
 
-def fetch_manifest_content(repo, manifest_path):
-    """Return the text of ``manifest_path`` in ``repo``'s default branch, or None.
+def _major(version):
+    """First numeric component of a version string, or None if unparseable."""
+    match = re.match(r"\s*[vV]?(\d+)", version or "")
+    return int(match.group(1)) if match else None
 
-    None means "couldn't determine" (missing path, fetch error) so callers can
-    stay conservative rather than assume the package is/ isn't declared there.
+
+def _range_floor(vulnerable_range):
+    """Lower bound of a vulnerable range (">= 2.0, < 3.0.3" -> "2.0"), or None.
+
+    Ranges shaped only as "< X" / "<= X" have no floor -- the installed version
+    could be any major below X, so the floor alone can't prove an in-major bump.
     """
-    if not manifest_path:
-        return None
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.raw+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    url = f"{GITHUB_API}/repos/{repo}/contents/{manifest_path.lstrip('/')}"
-    try:
-        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as exc:
-        warn_once(f"could not fetch manifest {manifest_path} ({exc})")
-        return None
-    if response.status_code != 200:
-        warn_once(f"could not fetch manifest {manifest_path} ({response.status_code})")
-        return None
-    return response.text
+    match = re.search(r">=?\s*([0-9][\w.\-]*)", vulnerable_range or "")
+    return match.group(1) if match else None
 
 
-def package_in_manifest(repo, package_name, manifest_path):
-    """True if ``package_name`` is declared as a delimited token in ``manifest_path``.
+# Manifest text cache: one fetch per manifest per run, however many alerts share it.
+_MANIFEST_CACHE = {}
 
-    Used only when the alert's dependency ``relationship`` is unknown, to decide
-    whether the package is a DIRECT dependency (declared in the manifest) that
-    Dependabot could bump, vs. a transitive one it can't. Returns False when the
-    manifest can't be read, so an unconfirmed dependency is NOT assumed
-    Dependabot-fixable (it falls through to Devin instead of being dropped).
+
+def installed_version_from_manifest(repo, cat):
+    """Pinned version of the alert's package in its manifest, or None.
+
+    Handles the two shapes this repo actually has: pip(-tools) pins
+    ("pkg==1.2.3") and package.json entries ('"pkg": "^1.2.3"'). Lockfile
+    formats beyond that return None and the caller falls back to the
+    vulnerable-range floor.
     """
-    content = fetch_manifest_content(repo, manifest_path)
-    if content is None:
-        return False
-    pkg = _normalize_package(package_name)
-    if not pkg:
-        return False
-    # Match the package as a delimited token so "redis" doesn't match "redis-py-cluster".
-    return re.search(rf"(^|[\s\"'/@]){re.escape(pkg)}([\s\"'/@=<>~!,;:\[\](){{}}-]|$)",
-                     content.lower(), re.MULTILINE) is not None
-
-
-_VERSION_RE = re.compile(r"\d+(?:\.\d+){0,2}")
-_UPPER_BOUND_RE = re.compile(r"(<=?)\s*v?(\d+(?:\.\d+){0,2})")
-
-
-def _parse_version(version):
-    """Return ``(major, minor, patch)`` for a version string, or None."""
-    match = re.match(r"\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", version or "")
-    if not match:
+    path, pkg = cat.get("manifest_path"), _normalize_package(cat.get("package"))
+    if not path or not pkg:
         return None
-    return tuple(int(part) if part else 0 for part in match.groups())
+    if path not in _MANIFEST_CACHE:
+        try:
+            response = requests.get(
+                f"{GITHUB_API}/repos/{repo}/contents/{path}",
+                headers={**_github_headers(), "Accept": "application/vnd.github.raw+json"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            _MANIFEST_CACHE[path] = response.text if response.status_code == 200 else ""
+        except requests.RequestException:
+            _MANIFEST_CACHE[path] = ""
+        if not _MANIFEST_CACHE[path]:
+            warn_once(f"could not read manifest {path}; falling back to range floors")
+    text = _MANIFEST_CACHE[path]
+    if not text:
+        return None
+    match = re.search(
+        rf"^\s*{re.escape(pkg)}\s*==\s*([0-9][\w.\-]*)", text, re.IGNORECASE | re.MULTILINE
+    ) or re.search(
+        rf'"{re.escape(cat.get("package") or pkg)}"\s*:\s*"[\^~>=<\s]*([0-9][\w.]*)"', text
+    )
+    return match.group(1) if match else None
 
 
-def is_major_bump(vulnerable_range, patched_identifier):
-    """True if reaching ``patched_identifier`` crosses a major version.
+def dependabot_capable(repo, cat):
+    """Predictive routing: could Dependabot fix this with a plain version bump?
 
-    A major bump likely carries API removals — Devin's lane, not a version-number
-    edit Dependabot can make. We derive the highest still-VULNERABLE major from the
-    range's upper bound (``< 3.0.0`` means 2.x is the top vulnerable major, since
-    3.0.0 is excluded; ``< 3.4.0`` keeps 3.x vulnerable), then compare it to the
-    patched major. Returns True when it can't tell, so an ambiguous bump is treated
-    as risky (sent to Devin, not left to Dependabot).
-    """
-    patched = _parse_version(patched_identifier)
-    if patched is None:
-        return True
-    patched_major = patched[0]
+    True only when the fix is bump-shaped FOR DEPENDABOT specifically: a
+    verifiably direct dependency (it can't bump the parent of a transitive
+    dep outside npm) whose patched version stays inside the installed major.
+    A cross-major patch implies possible API removals -- code migration is
+    Devin's lane, not a version-number edit.
 
-    bound = _UPPER_BOUND_RE.search(vulnerable_range or "")
-    if bound:
-        op = bound.group(1)
-        umajor, uminor, upatch = _parse_version(bound.group(2))
-        if op == "<" and uminor == 0 and upatch == 0:
-            # Exclusive bound on a major boundary (< 3.0.0): 3.x is not vulnerable,
-            # so the top vulnerable major is one below.
-            max_vulnerable_major = umajor - 1
-        else:
-            max_vulnerable_major = umajor
-        return patched_major > max_vulnerable_major
+    This is capability, not activity: it does not ask whether Dependabot has
+    opened a PR (that's the reactive skip upstream), it asks whether it COULD.
+    The reconcile loop enforces the prediction with a deadline
+    (DEPENDABOT_WAIT_HOURS), so a miss falls through to Devin instead of
+    rotting. Sensitivity and cascades are enforced upstream in routing order,
+    so this predicate does not re-check them.
 
-    # No parseable upper bound; fall back to the highest version named in the range.
-    majors = [_parse_version(v)[0] for v in _VERSION_RE.findall(vulnerable_range or "")]
-    if not majors:
-        return True
-    return patched_major > max(majors)
-
-
-def dependabot_capable(repo, cat, cascade_count):
-    """True if Dependabot can fix this alert on its own, without code changes.
-
-    Predictive (not reactive): lets the scanner leave the trivial, in-major,
-    direct-dependency bumps to Dependabot BEFORE Dependabot has opened a PR, so a
-    Devin session is spent only on what Dependabot can't do. Conservative on every
-    unknown — when a signal can't be determined it errs toward "not capable" so the
-    alert falls through to Devin rather than being dropped.
+    Returns (capable: bool, reason: str). The reason prints in the ledger
+    either way, so every routing decision explains itself.
     """
     if not cat["has_fix"]:
-        return False  # held lane anyway; no patched version to bump to
-
-    # 1. Direct dependency only — Dependabot can't fix transitive deps outside npm.
-    relationship = cat.get("relationship") or "unknown"
-    if relationship == "transitive":
-        return False
-    if relationship == "unknown":
-        if not package_in_manifest(repo, cat["package"], cat["manifest_path"]):
-            return False
-
-    # 2. Bump-safe: the patched version stays within the current major.
-    if is_major_bump(cat["vulnerable_range"], cat["patched_version"]):
-        return False
-
-    # 3. No cascade to other packages (only known once --check computed it).
-    if cascade_count is not None and cascade_count > 0:
-        return False
-
-    return True
+        return False, "no patched version"
+    if cat["relationship"] == "transitive":
+        return False, "transitive dep — Dependabot can't bump the parent"
+    patched_major = _major(cat["patched_version"])
+    if patched_major is None:
+        return False, f"unparseable patched version {cat['patched_version']!r}"
+    installed = installed_version_from_manifest(repo, cat)
+    if cat["relationship"] != "direct" and installed is None:
+        # relationship is None/unknown: a top-level pin in the manifest is the
+        # fallback proof of directness. No pin found -> can't verify -> Devin.
+        return False, "directness unverifiable (relationship unknown, no manifest pin)"
+    baseline = installed or _range_floor(cat["vulnerable_range"])
+    baseline_major = _major(baseline)
+    if baseline_major is None:
+        return False, "installed major unknown (no manifest pin, range has no floor)"
+    if baseline_major != patched_major:
+        return False, f"major bump {baseline_major}.x → {patched_major}.x — code migration is Devin's lane"
+    source = "manifest pin" if installed else "range floor"
+    return True, f"in-major bump {baseline} → {cat['patched_version']} ({source}), direct"
 
 
 def categorize_alert(alert):
@@ -479,16 +460,18 @@ def should_dispatch(cat):
     ordering (see ``priority``). We skip only alerts with no patched version,
     since a bump cannot resolve those.
 
-    Returns (dispatch: bool, reason: str).
+    Returns (dispatch: bool, verdict: str, reason: str). Verdict is the ledger
+    word: HELD means "nobody can fix this yet, reported"; SKIP means "policy
+    says leave it". They are different lanes and must print differently.
     """
     if not cat["has_fix"]:
         # No patched version exists yet; a bump cannot resolve it. Flag for a human.
-        return False, "no patched version available - flagged for human review"
+        return False, "HELD", "no patched version available — reported for human review"
     if cat["scope"] == "development":
-        return False, "dev-only dependency"
+        return False, "SKIP", "dev-only dependency"
     if SEVERITY_ORDER.get(cat["severity"], 0) < SEVERITY_ORDER[SEVERITY_THRESHOLD]:
-        return False, f"below severity threshold ({cat['severity']} < {SEVERITY_THRESHOLD})"
-    return True, "patched version available"
+        return False, "SKIP", f"below severity threshold ({cat['severity']} < {SEVERITY_THRESHOLD})"
+    return True, "OK", "patched version available"
 
 
 def priority_key(cat):
@@ -521,13 +504,20 @@ def save_state(state):
 
 def state_key(repo, cat):
     """Stable per-remediation key so we do not re-dispatch across runs.
+    """Stable per-remediation key so we do not re-dispatch across runs.
 
     Keyed by advisory + package (not manifest): one advisory can raise several
     alerts for the SAME package pinned in multiple manifests, and a single
     Devin session bumps the package across the whole repo. Keying on manifest
     too would dispatch a separate session per manifest for one CVE, so the key
     deliberately omits manifest_path to collapse those into one remediation.
+    Keyed by advisory + package (not manifest): one advisory can raise several
+    alerts for the SAME package pinned in multiple manifests, and a single
+    Devin session bumps the package across the whole repo. Keying on manifest
+    too would dispatch a separate session per manifest for one CVE, so the key
+    deliberately omits manifest_path to collapse those into one remediation.
     """
+    return f"{repo}#{cat['ghsa_id'] or cat['number']}#{cat['package']}"
     return f"{repo}#{cat['ghsa_id'] or cat['number']}#{cat['package']}"
 
 def _load_prompt_template(name):
@@ -609,8 +599,10 @@ def get_devin_session(session_id):
         )
     except requests.RequestException as exc:
         warn_once(f"could not fetch session {session_id} ({exc})")
+        warn_once(f"could not fetch session {session_id} ({exc})")
         return None
     if response.status_code != 200:
+        warn_once(f"could not fetch session {session_id} ({response.status_code})")
         warn_once(f"could not fetch session {session_id} ({response.status_code})")
         return None
     return response.json()
@@ -631,8 +623,10 @@ def send_session_message(session_id, message):
         )
     except requests.RequestException as exc:
         warn_once(f"could not message session {session_id} ({exc})")
+        warn_once(f"could not message session {session_id} ({exc})")
         return False
     if response.status_code not in (200, 201, 204):
+        warn_once(f"could not message session {session_id} ({response.status_code})")
         warn_once(f"could not message session {session_id} ({response.status_code})")
         return False
     return True
@@ -677,6 +671,7 @@ def discover_pr(repo, entry, session):
                     return pr.get("html_url"), pr.get("number"), "ghsa_search"
         except requests.RequestException as exc:
             warn_once(f"PR search failed for {ghsa} ({exc})")
+            warn_once(f"PR search failed for {ghsa} ({exc})")
     return None, None, None
 
 
@@ -703,6 +698,7 @@ def ci_status(repo, pr_number):
             return "unknown"
         check_runs = runs.json().get("check_runs", [])
     except requests.RequestException as exc:
+        warn_once(f"CI status fetch failed for PR #{pr_number} ({exc})")
         warn_once(f"CI status fetch failed for PR #{pr_number} ({exc})")
         return "unknown"
     if not check_runs:
@@ -771,8 +767,10 @@ def post_pr_comment(repo, pr_number, body):
         )
     except requests.RequestException as exc:
         warn_once(f"could not comment on PR #{pr_number} ({exc})")
+        warn_once(f"could not comment on PR #{pr_number} ({exc})")
         return False
     if response.status_code not in (200, 201):
+        warn_once(f"could not comment on PR #{pr_number} ({response.status_code})")
         warn_once(f"could not comment on PR #{pr_number} ({response.status_code})")
         return False
     return True
@@ -825,7 +823,9 @@ def open_tracking_issue(repo, entry, session_log=None):
         if response.status_code in (200, 201):
             return response.json().get("html_url")
         warn_once(f"could not open tracking issue ({response.status_code})")
+        warn_once(f"could not open tracking issue ({response.status_code})")
     except requests.RequestException as exc:
+        warn_once(f"could not open tracking issue ({exc})")
         warn_once(f"could not open tracking issue ({exc})")
     return None
 
@@ -860,7 +860,9 @@ def file_run_summary(repo, mode, counts, details, dry_run):
             print(f"SUMMARY filed: {response.json().get('html_url')}")
         else:
             warn_once(f"could not file run summary ({response.status_code})")
+            warn_once(f"could not file run summary ({response.status_code})")
     except requests.RequestException as exc:
+        warn_once(f"could not file run summary ({exc})")
         warn_once(f"could not file run summary ({exc})")
 
 
@@ -886,6 +888,86 @@ def _bump_retry_or_escalate(repo, entry, label, reason, nudge, session, dry_run)
         print(f"RETRY {label}: {reason} (attempt {entry['retries']}/{MAX_RETRIES})")
 
 
+def _promote_delegation(repo, entry, label, reason, dry_run):
+    """A delegation prediction missed; fall through to the paid owner.
+
+    Fires when Dependabot's PR never appeared inside DEPENDABOT_WAIT_HOURS, or
+    appeared and went red. Either way the free lane failed and the alert is
+    dispatched to Devin — a delegation is never allowed to rot.
+    """
+    if dry_run:
+        print(f"PROMO {label}: {reason} (dry-run: would dispatch Devin)")
+        return
+    cat = {
+        field: entry.get(field)
+        for field in (
+            "package", "ecosystem", "severity", "ghsa_id", "summary",
+            "vulnerable_range", "patched_version", "manifest_path", "url",
+        )
+    }
+    try:
+        session = dispatch_to_devin(build_prompt(repo, cat, review=False))
+    except Exception as exc:  # noqa: BLE001 - one flaky dispatch shouldn't kill the pass
+        print(f"FAIL  {label}: promotion dispatch failed ({exc}); will retry next reconcile")
+        return  # status unchanged; the deadline stays expired, so next pass retries
+    entry.update(
+        {
+            "status": "dispatched",
+            "session_id": session.get("session_id"),
+            "session_url": session.get("url"),
+            "retries": 0,
+            "promoted_because": reason,
+            "dispatched_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    print(f"PROMO {label}: {reason} -> {session.get('url')}")
+
+
+def _reconcile_delegated(repo, entry, label, dep_prs, dry_run):
+    """Drive a delegated entry: verify Dependabot's PR, or promote to Devin.
+
+    delegated -> dependabot_pr_open -> verified   (CI green: fixed for free)
+              ↘ deadline passed     -> dispatched (promoted to Devin)
+    dependabot_pr_open + red CI     -> dispatched (the free bump broke; Devin migrates)
+    """
+    dep_pr = find_dependabot_pr({"package": entry.get("package")}, dep_prs)
+    if dep_pr:
+        entry["pr_url"] = dep_pr.get("html_url")
+        entry["pr_number"] = dep_pr.get("number")
+        ci = ci_status(repo, dep_pr.get("number"))
+        entry["ci"] = ci
+        if ci == "success":
+            entry["status"] = "verified"
+            print(f"VERIFY {label}: Dependabot PR {entry['pr_url']} green — fixed for free")
+        elif ci == "failure":
+            _promote_delegation(
+                repo, entry, label,
+                f"Dependabot PR {entry['pr_url']} is red — the bump alone broke something",
+                dry_run,
+            )
+        else:
+            entry["status"] = "dependabot_pr_open"
+            print(f"WAIT  {label}: Dependabot PR {entry['pr_url']} CI {ci}")
+        return
+
+    delegated_at = entry.get("delegated_at")
+    try:
+        age_hours = (
+            datetime.now(timezone.utc) - datetime.fromisoformat(delegated_at)
+        ).total_seconds() / 3600
+    except (TypeError, ValueError):
+        age_hours = DEPENDABOT_WAIT_HOURS + 1  # unparseable timestamp: fail toward action
+    if age_hours >= DEPENDABOT_WAIT_HOURS:
+        _promote_delegation(
+            repo, entry, label,
+            f"no Dependabot PR after {age_hours:.0f}h (deadline {DEPENDABOT_WAIT_HOURS:g}h)",
+            dry_run,
+        )
+    else:
+        remaining = DEPENDABOT_WAIT_HOURS - age_hours
+        print(f"WAIT  {label}: delegated to Dependabot, {remaining:.0f}h left on the deadline")
+
+
 def reconcile(repo, state, dry_run):
     """Advance every non-terminal state entry toward a terminal state.
 
@@ -896,12 +978,24 @@ def reconcile(repo, state, dry_run):
     if not state:
         print("No recorded sessions to reconcile.")
         return
+    # One PR listing serves every delegated entry in the pass.
+    dep_prs = (
+        fetch_open_dependabot_prs(repo)
+        if any(e.get("status") in ("delegated", "dependabot_pr_open") for e in state.values())
+        else []
+    )
     for key, entry in state.items():
         entry.setdefault("status", "dispatched")
         label = f"[{entry.get('severity')}] {entry.get('package')} ({entry.get('ghsa_id')})"
 
         if entry["status"] in TERMINAL_STATES:
             print(f"DONE  {label}: {entry['status']} (terminal)")
+            continue
+
+        if entry["status"] in ("delegated", "dependabot_pr_open"):
+            _reconcile_delegated(repo, entry, label, dep_prs, dry_run)
+            if not dry_run:
+                save_state(state)
             continue
 
         session = get_devin_session(entry.get("session_id"))
@@ -1024,23 +1118,27 @@ def main():
     else:
         state = load_state()
 
-    # Skip alerts that already have an open fix PR -- whether Dependabot's own
-    # patch-available bump or a fix PR a prior scan already opened (which the state
-    # file, being local/ephemeral, may not remember). Either way Devin should not be
-    # dispatched to duplicate work that is already in flight.
-    open_prs = fetch_open_fix_prs(repo)
-    if open_prs:
-        print(f"Found {len(open_prs)} open PR(s); will skip alerts already covered by one.")
+    # Dependabot auto-opens PRs for the trivial patch-available bumps; skip those so
+    # Devin only handles what Dependabot can't (breaking/major bumps, no clean patch).
+    dep_prs = fetch_open_dependabot_prs(repo)
+    if dep_prs:
+        print(f"Found {len(dep_prs)} open Dependabot PR(s); will skip alerts they already cover.")
 
     # Categorize everything, then decide. Non-dispatch outcomes are reported up front.
     # Pass 1: categorize everything and split into skips vs. the dispatch queue.
     queue = []
     queued_keys = set()  # advisory+package already queued this run (multi-manifest dedup)
+    queued_keys = set()  # advisory+package already queued this run (multi-manifest dedup)
     details = []  # one markdown bullet per decision, for the run-summary issue
+    delegated = 0  # alerts routed to Dependabot on predicted capability (pass 1)
     for alert in alerts:
         cat = categorize_alert(alert)
         key = state_key(repo, cat)
         label = f"[{cat['severity']}] {cat['package']} ({cat['ghsa_id']})"
+
+        if key in queued_keys:
+            print(f"SKIP  {label}: same advisory already queued this run (another manifest)")
+            continue
 
         if key in queued_keys:
             print(f"SKIP  {label}: same advisory already queued this run (another manifest)")
@@ -1054,35 +1152,27 @@ def main():
         if key in state and is_forced:
             print(f"FORCE {label}: re-dispatching (was already handled)")
 
-        dispatch, reason = should_dispatch(cat)
+        dispatch, verdict, reason = should_dispatch(cat)
         if not dispatch:
-            print(f"SKIP  {label}: {reason}")
-            details.append(f"- ⏭️ SKIP {label} — {reason}")
+            print(f"{verdict:5s} {label}: {reason}")
+            emoji = "⏸️ HELD" if verdict == "HELD" else "⏭️ SKIP"
+            details.append(f"- {emoji} {label} — {reason}")
             continue
 
         sensitive = is_sensitive(cat)
-        fix_pr = find_fix_pr(cat, open_prs)
-        has_dep_pr = fix_pr is not None and fix_pr.get("author", "") in DEPENDABOT_LOGINS
-        # A fix PR opened by this system (or a human) for this exact advisory -- not
-        # Dependabot. The alert stays open until it merges; re-dispatching would just
-        # duplicate an in-flight fix, so skip it unconditionally (even sensitive ones:
-        # our own reviewed upgrade is already open).
-        if fix_pr is not None and not has_dep_pr:
-            print(f"SKIP  {label}: an open fix PR already remediates this advisory")
-            details.append(f"- ⏭️ SKIP {label} — fix PR already open")
-            continue
+        dep_pr = find_dependabot_pr(cat, dep_prs)
+        has_dep_pr = dep_pr is not None
 
         # --check: compute the upgrade's transitive cascade from the Dependabot PR's
         # dependency graph (base...head). If it touches more than MAX_CASCADE other
         # packages, escalate to a reviewed upgrade instead of letting it auto-merge.
-        cascade_count = None
         cascade_escalated = False
-        if args.check and has_dep_pr:
-            cascade_count = cascade_package_count(repo, fix_pr.get("base_ref"), fix_pr.get("head_ref"), cat)
-            if cascade_count is not None and cascade_count > MAX_CASCADE:
+        if args.check and dep_pr:
+            n = cascade_package_count(repo, dep_pr.get("base_ref"), dep_pr.get("head_ref"), cat)
+            if n is not None and n > MAX_CASCADE:
                 cascade_escalated = True
                 print(
-                    f"CHECK {label}: upgrade cascades to {cascade_count} other packages "
+                    f"CHECK {label}: upgrade cascades to {n} other packages "
                     f"(> MAX_CASCADE={MAX_CASCADE}); escalating to reviewed upgrade."
                 )
 
@@ -1094,15 +1184,6 @@ def main():
         if has_dep_pr and not review:
             print(f"SKIP  {label}: Dependabot already has an open PR for this package")
             details.append(f"- ⏭️ SKIP {label} — Dependabot PR already open")
-            continue
-
-        # Predictive owner routing: even before Dependabot opens a PR, if this is a
-        # trivial bump Dependabot can land on its own (direct dep, in-major, no
-        # cascade), leave it to Dependabot rather than spend a Devin session -- unless
-        # it's a sensitive/cascade-escalated alert that must get a reviewed upgrade.
-        if not review and dependabot_capable(repo, cat, cascade_count):
-            print(f"SKIP  {label}: Dependabot can resolve this on its own (direct, in-major, no cascade)")
-            details.append(f"- ⏭️ SKIP {label} — Dependabot-capable, left to Dependabot")
             continue
 
         if sensitive:
@@ -1120,6 +1201,46 @@ def main():
                 f"cascades to more than {MAX_CASCADE} packages; routing to reviewed upgrade."
             )
 
+        # Predictive delegation: route to Dependabot on CAPABILITY, not activity.
+        # (No Dependabot PR exists yet or we'd have skipped above; sensitive and
+        # cascade-escalated alerts never reach this branch.) The prediction gets
+        # a deadline: --reconcile promotes it to Devin if Dependabot's PR hasn't
+        # appeared within DEPENDABOT_WAIT_HOURS.
+        if not review:
+            capable, why = dependabot_capable(repo, cat)
+            if capable:
+                print(
+                    f"DELEG {label}: {why}; Dependabot's PR has "
+                    f"{DEPENDABOT_WAIT_HOURS:g}h to appear before Devin takes it"
+                )
+                details.append(
+                    f"- 🤝 DELEGATED {label} — {why}; promotes to Devin "
+                    f"if no Dependabot PR in {DEPENDABOT_WAIT_HOURS:g}h"
+                )
+                delegated += 1
+                if not args.dry_run:
+                    state[key] = {
+                        "status": "delegated",
+                        "severity": cat["severity"],
+                        "package": cat["package"],
+                        "ghsa_id": cat["ghsa_id"],
+                        "ecosystem": cat["ecosystem"],
+                        "summary": cat["summary"],
+                        "vulnerable_range": cat["vulnerable_range"],
+                        "patched_version": cat["patched_version"],
+                        "manifest_path": cat["manifest_path"],
+                        "url": cat["url"],
+                        "number": cat["number"],
+                        "delegate_reason": why,
+                        "retries": 0,
+                        "delegated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    save_state(state)
+                continue
+            # Not delegable: record why, so the dispatch ledger shows the reason
+            # this alert earns a Devin session instead of a free bump.
+            cat["route_reason"] = why
+
         queued_keys.add(key)
         queue.append((key, cat, label, review))
 
@@ -1134,6 +1255,10 @@ def main():
     for key, cat, label, review in to_dispatch:
         if review:
             label = f"[review] {label}"
+        if cat.get("route_reason"):
+            # The routing table explains itself: why this alert costs a Devin
+            # session instead of a free Dependabot bump.
+            label = f"{label} [{cat['route_reason']}]"
         if args.dry_run:
             mode = " (reviewed upgrade)" if review else ""
             print(f"WOULD DISPATCH  {label}{mode}")
@@ -1170,14 +1295,17 @@ def main():
         print(f"HOLD  {label}: rank {rank} of {len(queue)}, MAX_DISPATCH={MAX_DISPATCH} reached")
         details.append(f"- ⏸️ HOLD {label} — rank {rank}, cap reached")
     verb = "would dispatch" if args.dry_run else "dispatched"
-    summary = f"Done. {verb} {dispatched} session(s); {len(held)} held"
+    summary = (
+        f"Done. {verb} {dispatched} session(s); "
+        f"{delegated} delegated to Dependabot (free); {len(held)} held"
+    )
     if failed:
         summary += f"; {failed} FAILED (will retry next run)"
     print(summary + ".")
 
     file_run_summary(
         repo, "scan",
-        {"dispatched": dispatched, "held": len(held), "failed": failed},
+        {"dispatched": dispatched, "delegated": delegated, "held": len(held), "failed": failed},
         details, args.dry_run,
     )
 
