@@ -375,13 +375,15 @@ def save_state(state):
 
 
 def state_key(repo, cat):
-    """Stable per-alert key so we do not re-dispatch across runs.
+    """Stable per-remediation key so we do not re-dispatch across runs.
 
-    GHSA id alone is not unique: one advisory can produce multiple alerts
-    (same package in several manifests, or several packages under one GHSA),
-    so the key includes package and manifest path.
+    Keyed by advisory + package (not manifest): one advisory can raise several
+    alerts for the SAME package pinned in multiple manifests, and a single
+    Devin session bumps the package across the whole repo. Keying on manifest
+    too would dispatch a separate session per manifest for one CVE, so the key
+    deliberately omits manifest_path to collapse those into one remediation.
     """
-    return f"{repo}#{cat['ghsa_id'] or cat['number']}#{cat['package']}#{cat['manifest_path']}"
+    return f"{repo}#{cat['ghsa_id'] or cat['number']}#{cat['package']}"
 
 def _load_prompt_template(name):
     """Read a prompt template from the templates/ directory (fail loudly if missing)."""
@@ -886,11 +888,16 @@ def main():
     # Categorize everything, then decide. Non-dispatch outcomes are reported up front.
     # Pass 1: categorize everything and split into skips vs. the dispatch queue.
     queue = []
+    queued_keys = set()  # advisory+package already queued this run (multi-manifest dedup)
     details = []  # one markdown bullet per decision, for the run-summary issue
     for alert in alerts:
         cat = categorize_alert(alert)
         key = state_key(repo, cat)
         label = f"[{cat['severity']}] {cat['package']} ({cat['ghsa_id']})"
+
+        if key in queued_keys:
+            print(f"SKIP  {label}: same advisory already queued this run (another manifest)")
+            continue
 
         is_forced = (cat["ghsa_id"] or "").lower() in forced
         if key in state and not is_forced:
@@ -948,6 +955,7 @@ def main():
                 f"cascades to more than {MAX_CASCADE} packages; routing to reviewed upgrade."
             )
 
+        queued_keys.add(key)
         queue.append((key, cat, label, review))
 
     # Rank the queue - highest severity first, direct deps before transitive -
