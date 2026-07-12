@@ -59,7 +59,8 @@ type, action whitelist, payload shape, routing label, dedup, dispatch. Webhook
 delivery is at-least-once, so the handler is idempotent by construction.
 
 **Reconcile loop** (`--reconcile`): drives every dispatched session to a
-terminal state. Discovers the fix PR, checks CI, nudges stuck sessions with a
+terminal state. Discovers the fix PR, reads its CI status when checks are configured
+(on this fork, upstream CI can't run — see note below), nudges stuck sessions with a
 follow-up message (bounded by `MAX_RETRIES`), then either verifies or
 escalates with a tracking issue containing the full session log.
 
@@ -70,6 +71,8 @@ dispatched → pr_open → verified            (terminal: success)
 ```
 
 Rem **never merges PRs**. The human-merge gate is policy, not a TODO.
+
+Fork scoping note: apache/superset's CI can't run on a fork (missing secrets, self-hosted runners), so it's disabled here and PRs verify to pr_open / awaiting review rather than a green-check verified. In a real engagement, the customer's pipeline is the verification authority — reconcile reads their check runs, not Devin's self-report.
 
 ## Policy is configuration
 
@@ -126,13 +129,6 @@ Label an issue `Remediate` and the orchestrator dispatches it.
   starts with context instead of archaeology.
 - **PR labels** — `rem:routine-bump` vs `rem:needs-careful-review` make triage
   legible at a glance in the PR list.
-
-## Demo case: paramiko
-
-The centerpiece alert in the Superset fork: paramiko 3.x removed `DSSKey`,
-which breaks `sshtunnel` — a real CVE with a real cascade. Rem categorizes
-it, `--check` computes the cascade, routes it through the reviewed-upgrade
-path, and Devin ships the fix PR with the session log attached.
 
 ## Design decisions
 
