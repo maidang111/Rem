@@ -44,7 +44,8 @@ Two event-driven lanes, one policy brain:
 alerts, categorizes each (severity, scope, patched version, sensitivity),
 ranks the queue, and routes every alert to its **cheapest capable owner**:
 
-- Trivial bump Dependabot already has a PR for → **skip, Dependabot owns it**
+- Any open fix PR already covers the alert (Dependabot's bump, or a fix PR a
+  prior scan opened) → **skip, don't duplicate in-flight work**
 - Patch exists, low blast radius → **Devin session** (routine upgrade prompt)
 - Sensitive package or cascade > `MAX_CASCADE` → **Devin reviewed-upgrade path**,
   PR labeled `rem:needs-careful-review`
@@ -151,10 +152,12 @@ codebase worse, never drop a finding silently). Code pointers are to
   Never spend a Devin session where Dependabot already works; never spend a
   human where Devin suffices. *(`should_dispatch`, and the Dependabot-dedup skip
   in the scan loop.)*
-- **Don't duplicate Dependabot's free work.** If Dependabot already has an open
-  bump PR for the package, skip it — *unless* the package is sensitive or the
-  cascade check escalated it. *(`fetch_open_dependabot_prs` +
-  `find_dependabot_pr` → the `has_dep_pr and not review` skip.)*
+- **Don't duplicate work already in flight.** If an open PR already remediates
+  the alert, skip it. A fix PR from a prior scan (matched by the advisory's GHSA
+  id, any author) is skipped unconditionally; a Dependabot bump PR (matched by
+  package name) is skipped *unless* the package is sensitive or the cascade check
+  escalated it. *(`fetch_open_fix_prs` + `find_fix_pr` → the `not has_dep_pr` and
+  `has_dep_pr and not review` skips.)*
 - **Minimum-bump policy.** Prompts tell Devin to upgrade to **at least** the
   first patched version — and if the repo already constrains the package to a
   higher compatible version, use that instead, never downgrade another

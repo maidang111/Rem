@@ -49,7 +49,7 @@ def warn_once(message):
     if message in _SEEN_WARNINGS:
         return
     _SEEN_WARNINGS.add(message)
-    warn_once(f"{message}")
+    print(f"WARN: {message}")
 
 # Devin prompt text lives in these template files so it can be edited without code changes.
 TEMPLATE_DIR = Path(os.getenv("PROMPT_TEMPLATE_DIR", Path(__file__).parent / "templates"))
@@ -176,12 +176,23 @@ def fetch_open_alerts(repo):
     return alerts
 
 
-def fetch_open_dependabot_prs(repo):
-    """Return open PRs opened by Dependabot as ``[{"title", "head_ref"}, ...]``.
+DEPENDABOT_LOGINS = {"dependabot[bot]", "dependabot-preview[bot]"}
 
-    Used to skip alerts Dependabot is already fixing on its own (the trivial,
-    patch-available bumps), so Devin is not dispatched to duplicate that work.
-    Returns ``[]`` on any fetch error so a failure here never blocks scanning.
+
+def fetch_open_fix_prs(repo):
+    """Return every open PR as ``[{"title", "head_ref", "base_ref", "body", "author"}, ...]``.
+
+    Used to skip alerts that are ALREADY being fixed by an open PR, so Devin is
+    not dispatched to duplicate work. That covers two cases:
+      * Dependabot's own trivial patch-available bumps ("Bump <pkg> from ..."), and
+      * a fix PR a prior scan already opened (Devin/human), which references the
+        advisory's GHSA id -- the alert stays open until that PR merges, so
+        without this the next run re-dispatches an alert that's already handled.
+
+    Author-scoped filtering would miss the second case entirely (this system's own
+    PRs are not authored by ``dependabot[bot]``), so we return all open PRs and let
+    ``find_fix_pr`` decide what actually covers a given alert. Returns ``[]`` on any
+    fetch error so a failure here never blocks scanning.
     """
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
@@ -201,22 +212,22 @@ def fetch_open_dependabot_prs(repo):
             if response.status_code != 200:
                 warn_once(
                     f"could not list PRs for dedup ({response.status_code}); "
-                    "proceeding without Dependabot-PR dedup"
+                    "proceeding without open-fix-PR dedup"
                 )
                 return []
             batch = response.json()
             if not batch:
                 break
             for pr in batch:
-                login = (pr.get("user") or {}).get("login", "")
-                if login in ("dependabot[bot]", "dependabot-preview[bot]"):
-                    prs.append(
-                        {
-                            "title": pr.get("title", ""),
-                            "head_ref": (pr.get("head") or {}).get("ref", ""),
-                            "base_ref": (pr.get("base") or {}).get("ref", ""),
-                        }
-                    )
+                prs.append(
+                    {
+                        "title": pr.get("title", ""),
+                        "head_ref": (pr.get("head") or {}).get("ref", ""),
+                        "base_ref": (pr.get("base") or {}).get("ref", ""),
+                        "body": pr.get("body") or "",
+                        "author": (pr.get("user") or {}).get("login", ""),
+                    }
+                )
             if len(batch) < 100:
                 break
             page += 1
@@ -231,27 +242,39 @@ def _normalize_package(name):
     return (name or "").lower().lstrip("@")
 
 
-def find_dependabot_pr(cat, dep_prs):
-    """Return the open Dependabot PR that bumps this alert's package, or None.
+def find_fix_pr(cat, prs):
+    """Return an open PR that already remediates this alert, or None.
 
-    Matches the package name as a delimited token in either the PR title
-    ("Bump <pkg> from ...") or the branch ref ("dependabot/<eco>/.../<pkg>-<ver>"),
-    so scoped names like ``@babel/traverse`` match without false positives on
-    packages that merely share a prefix.
+    Two independent, deliberately-narrow signals so we never mistake an unrelated
+    PR for a fix:
+      * GHSA id (any author): the dispatch prompts instruct Devin to reference the
+        advisory's GHSA id in the PR, so a case-insensitive token match on the
+        title/branch/body means this exact advisory is already being fixed.
+      * package name (Dependabot-authored PRs only): Dependabot titles/branches name
+        the package but not the GHSA, so match the package as a delimited token
+        ("Bump <pkg> from ...", "dependabot/<eco>/.../<pkg>-<ver>"). Restricting
+        this to Dependabot avoids false positives on human PRs that merely mention
+        the package.
     """
+    ghsa = (cat.get("ghsa_id") or "").lower()
+    ghsa_pattern = re.compile(rf"(^|[^0-9a-z-]){re.escape(ghsa)}([^0-9a-z-]|$)") if ghsa else None
+
     pkg = _normalize_package(cat["package"])
-    if not pkg:
-        return None
-    pattern = re.compile(rf"(^|[\s/@]){re.escape(pkg)}([\s\-/@]|$)")
-    for pr in dep_prs:
-        if pattern.search(pr["title"].lower()) or pattern.search(pr["head_ref"].lower()):
+    pkg_pattern = re.compile(rf"(^|[\s/@]){re.escape(pkg)}([\s\-/@]|$)") if pkg else None
+
+    for pr in prs:
+        haystacks = (pr["title"].lower(), pr["head_ref"].lower(), pr["base_ref"].lower(), pr["body"].lower())
+        if ghsa_pattern and any(ghsa_pattern.search(h) for h in haystacks):
             return pr
+        if pkg_pattern and pr.get("author", "") in DEPENDABOT_LOGINS:
+            if pkg_pattern.search(pr["title"].lower()) or pkg_pattern.search(pr["head_ref"].lower()):
+                return pr
     return None
 
 
-def has_open_dependabot_pr(cat, dep_prs):
-    """True if an open Dependabot PR already bumps this alert's package."""
-    return find_dependabot_pr(cat, dep_prs) is not None
+def has_open_fix_pr(cat, prs):
+    """True if an open PR already remediates this alert."""
+    return find_fix_pr(cat, prs) is not None
 
 
 def cascade_package_count(repo, base, head, cat):
@@ -879,11 +902,13 @@ def main():
     else:
         state = load_state()
 
-    # Dependabot auto-opens PRs for the trivial patch-available bumps; skip those so
-    # Devin only handles what Dependabot can't (breaking/major bumps, no clean patch).
-    dep_prs = fetch_open_dependabot_prs(repo)
-    if dep_prs:
-        print(f"Found {len(dep_prs)} open Dependabot PR(s); will skip alerts they already cover.")
+    # Skip alerts that already have an open fix PR -- whether Dependabot's own
+    # patch-available bump or a fix PR a prior scan already opened (which the state
+    # file, being local/ephemeral, may not remember). Either way Devin should not be
+    # dispatched to duplicate work that is already in flight.
+    open_prs = fetch_open_fix_prs(repo)
+    if open_prs:
+        print(f"Found {len(open_prs)} open PR(s); will skip alerts already covered by one.")
 
     # Categorize everything, then decide. Non-dispatch outcomes are reported up front.
     # Pass 1: categorize everything and split into skips vs. the dispatch queue.
@@ -914,15 +939,23 @@ def main():
             continue
 
         sensitive = is_sensitive(cat)
-        dep_pr = find_dependabot_pr(cat, dep_prs)
-        has_dep_pr = dep_pr is not None
+        fix_pr = find_fix_pr(cat, open_prs)
+        has_dep_pr = fix_pr is not None and fix_pr.get("author", "") in DEPENDABOT_LOGINS
+        # A fix PR opened by this system (or a human) for this exact advisory -- not
+        # Dependabot. The alert stays open until it merges; re-dispatching would just
+        # duplicate an in-flight fix, so skip it unconditionally (even sensitive ones:
+        # our own reviewed upgrade is already open).
+        if fix_pr is not None and not has_dep_pr:
+            print(f"SKIP  {label}: an open fix PR already remediates this advisory")
+            details.append(f"- ⏭️ SKIP {label} — fix PR already open")
+            continue
 
         # --check: compute the upgrade's transitive cascade from the Dependabot PR's
         # dependency graph (base...head). If it touches more than MAX_CASCADE other
         # packages, escalate to a reviewed upgrade instead of letting it auto-merge.
         cascade_escalated = False
-        if args.check and dep_pr:
-            n = cascade_package_count(repo, dep_pr.get("base_ref"), dep_pr.get("head_ref"), cat)
+        if args.check and has_dep_pr:
+            n = cascade_package_count(repo, fix_pr.get("base_ref"), fix_pr.get("head_ref"), cat)
             if n is not None and n > MAX_CASCADE:
                 cascade_escalated = True
                 print(
