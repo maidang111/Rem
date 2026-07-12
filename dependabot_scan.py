@@ -37,6 +37,20 @@ load_dotenv()
 
 GITHUB_API = "https://api.github.com"
 DEVIN_API = "https://api.devin.ai/v1"
+
+# Warnings about transient/environmental conditions (a failed dedup fetch, an
+# unavailable cascade endpoint) can otherwise fire once per alert and bury the
+# actual decisions. Deduplicate identical warning lines so each prints once.
+_SEEN_WARNINGS = set()
+
+
+def warn_once(message):
+    """Print a ``WARN`` line only the first time this exact message is seen."""
+    if message in _SEEN_WARNINGS:
+        return
+    _SEEN_WARNINGS.add(message)
+    warn_once(f"{message}")
+
 # Devin prompt text lives in these template files so it can be edited without code changes.
 TEMPLATE_DIR = Path(os.getenv("PROMPT_TEMPLATE_DIR", Path(__file__).parent / "templates"))
 
@@ -185,8 +199,8 @@ def fetch_open_dependabot_prs(repo):
                 timeout=REQUEST_TIMEOUT,
             )
             if response.status_code != 200:
-                print(
-                    f"WARN  could not list PRs for dedup ({response.status_code}); "
+                warn_once(
+                    f"could not list PRs for dedup ({response.status_code}); "
                     "proceeding without Dependabot-PR dedup"
                 )
                 return []
@@ -207,7 +221,7 @@ def fetch_open_dependabot_prs(repo):
                 break
             page += 1
     except requests.RequestException as exc:
-        print(f"WARN  could not list PRs for dedup ({exc}); proceeding without dedup")
+        warn_once(f"could not list PRs for dedup ({exc}); proceeding without dedup")
         return []
     return prs
 
@@ -259,10 +273,10 @@ def cascade_package_count(repo, base, head, cat):
     try:
         response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
     except requests.RequestException as exc:
-        print(f"WARN  cascade check failed ({exc}); not escalating")
+        warn_once(f"cascade check failed ({exc}); not escalating")
         return None
     if response.status_code != 200:
-        print(f"WARN  cascade check unavailable ({response.status_code}); not escalating")
+        warn_once(f"cascade check unavailable ({response.status_code}); not escalating")
         return None
     target = _normalize_package(cat["package"])
     changed = {_normalize_package(dep.get("name", "")) for dep in response.json()}
@@ -447,10 +461,10 @@ def get_devin_session(session_id):
             f"{DEVIN_API}/session/{session_id}", headers=headers, timeout=REQUEST_TIMEOUT
         )
     except requests.RequestException as exc:
-        print(f"WARN  could not fetch session {session_id} ({exc})")
+        warn_once(f"could not fetch session {session_id} ({exc})")
         return None
     if response.status_code != 200:
-        print(f"WARN  could not fetch session {session_id} ({response.status_code})")
+        warn_once(f"could not fetch session {session_id} ({response.status_code})")
         return None
     return response.json()
 
@@ -469,10 +483,10 @@ def send_session_message(session_id, message):
             timeout=REQUEST_TIMEOUT,
         )
     except requests.RequestException as exc:
-        print(f"WARN  could not message session {session_id} ({exc})")
+        warn_once(f"could not message session {session_id} ({exc})")
         return False
     if response.status_code not in (200, 201, 204):
-        print(f"WARN  could not message session {session_id} ({response.status_code})")
+        warn_once(f"could not message session {session_id} ({response.status_code})")
         return False
     return True
 
@@ -515,7 +529,7 @@ def discover_pr(repo, entry, session):
                     pr = items[0]
                     return pr.get("html_url"), pr.get("number"), "ghsa_search"
         except requests.RequestException as exc:
-            print(f"WARN  PR search failed for {ghsa} ({exc})")
+            warn_once(f"PR search failed for {ghsa} ({exc})")
     return None, None, None
 
 
@@ -542,7 +556,7 @@ def ci_status(repo, pr_number):
             return "unknown"
         check_runs = runs.json().get("check_runs", [])
     except requests.RequestException as exc:
-        print(f"WARN  CI status fetch failed for PR #{pr_number} ({exc})")
+        warn_once(f"CI status fetch failed for PR #{pr_number} ({exc})")
         return "unknown"
     if not check_runs:
         return "unknown"
@@ -609,10 +623,10 @@ def post_pr_comment(repo, pr_number, body):
             timeout=REQUEST_TIMEOUT,
         )
     except requests.RequestException as exc:
-        print(f"WARN  could not comment on PR #{pr_number} ({exc})")
+        warn_once(f"could not comment on PR #{pr_number} ({exc})")
         return False
     if response.status_code not in (200, 201):
-        print(f"WARN  could not comment on PR #{pr_number} ({response.status_code})")
+        warn_once(f"could not comment on PR #{pr_number} ({response.status_code})")
         return False
     return True
 
@@ -663,9 +677,9 @@ def open_tracking_issue(repo, entry, session_log=None):
         )
         if response.status_code in (200, 201):
             return response.json().get("html_url")
-        print(f"WARN  could not open tracking issue ({response.status_code})")
+        warn_once(f"could not open tracking issue ({response.status_code})")
     except requests.RequestException as exc:
-        print(f"WARN  could not open tracking issue ({exc})")
+        warn_once(f"could not open tracking issue ({exc})")
     return None
 
 
@@ -698,9 +712,9 @@ def file_run_summary(repo, mode, counts, details, dry_run):
         if response.status_code in (200, 201):
             print(f"SUMMARY filed: {response.json().get('html_url')}")
         else:
-            print(f"WARN  could not file run summary ({response.status_code})")
+            warn_once(f"could not file run summary ({response.status_code})")
     except requests.RequestException as exc:
-        print(f"WARN  could not file run summary ({exc})")
+        warn_once(f"could not file run summary ({exc})")
 
 
 def _bump_retry_or_escalate(repo, entry, label, reason, nudge, session, dry_run):
