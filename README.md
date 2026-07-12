@@ -50,6 +50,11 @@ ranks the queue, and routes every alert to its **cheapest capable owner**:
   PR labeled `rem:needs-careful-review`
 - No patched version → **held**, reported, never silently dropped
 
+One advisory can raise several alerts for the same package pinned in multiple
+manifests; Rem keys a remediation by `repo#ghsa#package` (not manifest), so a
+multi-manifest CVE dispatches **one** session that bumps the package repo-wide,
+not one per file.
+
 Severity **ranks the queue; it does not gate it**. If a patch exists, the
 default policy is to take it — severity just decides who goes first.
 
@@ -129,19 +134,99 @@ Label an issue `Remediate` and the orchestrator dispatches it.
   starts with context instead of archaeology.
 - **PR labels** — `rem:routine-bump` vs `rem:needs-careful-review` make triage
   legible at a glance in the PR list.
+- **Externalized prompt templates** (`templates/*.md`) — tune Devin's wording
+  per deployment without touching code.
 
-## Design decisions
+## Architecture decisions
 
-- **Cheapest capable owner.** Never spend a Devin session where Dependabot
-  works for free; never spend a human where Devin suffices.
-- **No security-justification-free version bumps.** Bumps cost review time,
-  can introduce new vulnerabilities, and cause breakage. A vuln *with* a patch
+Every decision below is a deliberate policy choice, grouped by the two
+properties the system optimizes for: **cost-efficiency** (spend the least
+capable resource that can safely close a vuln) and **safety** (never make the
+codebase worse, never drop a finding silently). Code pointers are to
+`dependabot_scan.py` unless noted.
+
+### Routing & cost-efficiency
+
+- **Cheapest capable owner.** Dependabot (free) → Devin → human, in that order.
+  Never spend a Devin session where Dependabot already works; never spend a
+  human where Devin suffices. *(`should_dispatch`, and the Dependabot-dedup skip
+  in the scan loop.)*
+- **Don't duplicate Dependabot's free work.** If Dependabot already has an open
+  bump PR for the package, skip it — *unless* the package is sensitive or the
+  cascade check escalated it. *(`fetch_open_dependabot_prs` +
+  `find_dependabot_pr` → the `has_dep_pr and not review` skip.)*
+- **Minimum-bump policy.** Prompts tell Devin to upgrade to **at least** the
+  first patched version — and if the repo already constrains the package to a
+  higher compatible version, use that instead, never downgrade another
+  dependency to hit the target. Smallest change that closes the vuln, no
+  opportunistic jumps to latest. *(`templates/routine_upgrade.md`,
+  `templates/reviewed_upgrade.md`.)*
+- **No security-justification-free version bumps.** Bumps cost review time, can
+  introduce new vulnerabilities, and cause breakage. A vuln *with* a patch
   always gets fixed — by the cheapest owner. Hygiene bumps don't.
-- **Ranks, not gates.** Suppressing low-severity alerts is a deployment choice
-  (`SEVERITY_THRESHOLD`), not a default. The safest state for a patched vuln
-  is patched.
-- **Idempotent everywhere.** At-least-once webhooks, `idempotent: true` on
-  session creation, stable per-alert state keys (`repo#ghsa#package#manifest`).
+- **Ranks, not gates.** Severity orders the queue; it does not filter it.
+  Suppressing low-severity alerts is a deployment choice (`SEVERITY_THRESHOLD`),
+  not a default — the safest state for a patched vuln is patched. `MAX_DISPATCH`
+  then caps sessions per run *after* ranking, so criticals are never held behind
+  earlier low-severity alerts; the rest drain on later runs. *(`priority_key`,
+  then `queue[:MAX_DISPATCH]`.)*
+- **Direct-before-transitive tiebreak.** At equal severity, directly-declared
+  dependencies rank ahead of transitive ones — a cheap proxy for exposure.
+  *(`priority_key`.)*
+- **Skip the unfixable and the irrelevant.** No published patch → held and
+  reported (a bump can't fix it); development-only dependencies → skipped (they
+  don't ship to production). *(`should_dispatch`.)*
+- **One remediation per advisory + package.** State is keyed `repo#ghsa#package`,
+  so the same CVE across multiple manifests collapses into a single Devin
+  session instead of N duplicate ones. *(`state_key`, plus a per-run
+  `queued_keys` guard.)*
+
+### Safety
+
+- **Cascade check via the GitHub dependency-graph compare API.** `--check`
+  measures how many *other* packages a Dependabot bump actually moves
+  (`base...head` on the resolved graph) rather than guessing. Cascades beyond
+  `MAX_CASCADE` are escalated to the reviewed-upgrade path, not auto-applied.
+  *(`cascade_package_count`.)*
+- **Sensitive-package override.** High-blast-radius packages
+  (`sensitive_packages.txt`) always get a *reviewed* upgrade and bypass the
+  Dependabot-dedup skip — an insta-bump on these is too risky. *(`is_sensitive`.)*
+- **Two working modes, chosen by policy.** `routine_upgrade.md` (bump → fix
+  breakage → test → PR) for ordinary alerts; `reviewed_upgrade.md` (audit the
+  blast radius → read the upstream changelog → adapt every call site → full test
+  suite → `rem:needs-careful-review`) for sensitive or wide-cascade bumps. The
+  sensitive/cascade decisions don't just flag an alert — they switch Devin into
+  a fundamentally more careful mode.
+- **Human-merge gate.** Rem prepares and verifies; a human always merges to
+  mainline. Reconcile never merges — that's policy, not a TODO. Both upgrade
+  paths require a human before merge; the reviewed path additionally forces a
+  documented blast-radius + changelog review.
+- **Every alert ends terminal.** The reconcile loop drives each dispatched
+  alert to `verified` (PR + green CI) or `escalated` (retries exhausted →
+  tracking issue with the full session log). Bounded by `MAX_RETRIES`. Nothing
+  is silently dropped. *(`reconcile`, `_bump_retry_or_escalate`.)*
+
+Every decision above is also visible in the run output and the Issues tab — see
+[Observability](#observability) for the dashboard, per-alert state, escalation
+issues, PR labels, and externalized prompt templates.
+
+### Reliability & correctness
+
+- **Idempotent everywhere.** At-least-once webhooks (`app.py` dedup gate),
+  `idempotent: true` on Devin session creation, and stable per-remediation state
+  keys (`repo#ghsa#package`) so re-runs never double-dispatch or double-fix.
+- **`--dry-run` never mutates.** No sessions, comments, issues, or state
+  writes — a safe preview of every decision.
+- **Fail-loud config, fail-soft runtime.** Missing credentials abort up front
+  (`require_config`); a single flaky dispatch or API call is isolated so it
+  can't kill the run; every HTTP call has a timeout (`REQUEST_TIMEOUT`) so a
+  hung endpoint can't stall the scan; a dispatch failure exits non-zero so a
+  scheduler can alert.
+- **Warnings deduped.** Transient/environmental warnings print once per run
+  (`warn_once`) so they don't bury the actual decisions.
+- **Seven ordered webhook gates.** `app.py` walks HMAC signature → event type →
+  action whitelist → payload shape → routing label → dedup → dispatch, in that
+  order, so untrusted input is rejected before any work happens.
 
 ## Roadmap
 
