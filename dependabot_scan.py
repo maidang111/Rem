@@ -49,21 +49,7 @@ def warn_once(message):
     if message in _SEEN_WARNINGS:
         return
     _SEEN_WARNINGS.add(message)
-    warn_once(f"{message}")
-
-
-# Warnings about transient/environmental conditions (a failed dedup fetch, an
-# unavailable cascade endpoint) can otherwise fire once per alert and bury the
-# actual decisions. Deduplicate identical warning lines so each prints once.
-_SEEN_WARNINGS = set()
-
-
-def warn_once(message):
-    """Print a ``WARN`` line only the first time this exact message is seen."""
-    if message in _SEEN_WARNINGS:
-        return
-    _SEEN_WARNINGS.add(message)
-    warn_once(f"{message}")
+    print(f"WARN: {message}")
 
 # Devin prompt text lives in these template files so it can be edited without code changes.
 TEMPLATE_DIR = Path(os.getenv("PROMPT_TEMPLATE_DIR", Path(__file__).parent / "templates"))
@@ -225,8 +211,6 @@ def fetch_open_dependabot_prs(repo):
             if response.status_code != 200:
                 warn_once(
                     f"could not list PRs for dedup ({response.status_code}); "
-                warn_once(
-                    f"could not list PRs for dedup ({response.status_code}); "
                     "proceeding without Dependabot-PR dedup"
                 )
                 return []
@@ -249,7 +233,6 @@ def fetch_open_dependabot_prs(repo):
                 break
             page += 1
     except requests.RequestException as exc:
-        warn_once(f"could not list PRs for dedup ({exc}); proceeding without dedup")
         warn_once(f"could not list PRs for dedup ({exc}); proceeding without dedup")
         return []
     return prs
@@ -283,6 +266,81 @@ def has_open_dependabot_pr(cat, dep_prs):
     return find_dependabot_pr(cat, dep_prs) is not None
 
 
+DEPENDABOT_LOGINS = ("dependabot[bot]", "dependabot-preview[bot]")
+
+
+def fetch_open_fix_prs(repo):
+    """Return ALL open PRs as ``[{title, head_ref, base_ref, body, author, number, html_url}]``.
+
+    Unlike ``fetch_open_dependabot_prs`` this keeps every author, so a fix PR a
+    prior scan (on a ``devin/...`` branch) or a human already opened can be matched
+    by advisory id and not dispatched again. Returns ``[]`` on any fetch error so a
+    failure here never blocks scanning.
+    """
+    prs = []
+    page = 1
+    try:
+        while True:
+            response = requests.get(
+                f"{GITHUB_API}/repos/{repo}/pulls",
+                headers=_github_headers(),
+                params={"state": "open", "per_page": 100, "page": page},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if response.status_code != 200:
+                warn_once(
+                    f"could not list PRs for dedup ({response.status_code}); "
+                    "proceeding without open-fix-PR dedup"
+                )
+                return []
+            batch = response.json()
+            if not batch:
+                break
+            for pr in batch:
+                prs.append(
+                    {
+                        "title": pr.get("title", ""),
+                        "head_ref": (pr.get("head") or {}).get("ref", ""),
+                        "base_ref": (pr.get("base") or {}).get("ref", ""),
+                        "body": pr.get("body") or "",
+                        "author": (pr.get("user") or {}).get("login", ""),
+                        "number": pr.get("number"),
+                        "html_url": pr.get("html_url", ""),
+                    }
+                )
+            if len(batch) < 100:
+                break
+            page += 1
+    except requests.RequestException as exc:
+        warn_once(f"could not list PRs for dedup ({exc}); proceeding without dedup")
+        return []
+    return prs
+
+
+def find_fix_pr(cat, prs):
+    """Return an open PR that already remediates this alert, or None.
+
+    Matches the advisory GHSA id as a delimited token in any author's PR title,
+    branch refs, or body. That catches a fix PR a prior scan opened on a
+    ``devin/...`` branch (Dependabot's own bump PRs are matched separately by
+    ``find_dependabot_pr`` and routed by the sensitivity/cascade rules).
+    """
+    ghsa = (cat.get("ghsa_id") or "").lower()
+    if not ghsa:
+        return None
+    pattern = re.compile(rf"(^|[^0-9a-z-]){re.escape(ghsa)}([^0-9a-z-]|$)")
+    for pr in prs:
+        haystacks = (
+            pr["title"].lower(),
+            pr["head_ref"].lower(),
+            pr["base_ref"].lower(),
+            pr["body"].lower(),
+        )
+        if any(pattern.search(h) for h in haystacks):
+            return pr
+    return None
+
+
 def cascade_package_count(repo, base, head, cat):
     """Count OTHER packages a Dependabot bump changes, via the dependency-graph
     compare API (base...head). Returns an int, or None if it can't be determined.
@@ -303,10 +361,8 @@ def cascade_package_count(repo, base, head, cat):
         response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
     except requests.RequestException as exc:
         warn_once(f"cascade check failed ({exc}); not escalating")
-        warn_once(f"cascade check failed ({exc}); not escalating")
         return None
     if response.status_code != 200:
-        warn_once(f"cascade check unavailable ({response.status_code}); not escalating")
         warn_once(f"cascade check unavailable ({response.status_code}); not escalating")
         return None
     target = _normalize_package(cat["package"])
@@ -504,20 +560,13 @@ def save_state(state):
 
 def state_key(repo, cat):
     """Stable per-remediation key so we do not re-dispatch across runs.
-    """Stable per-remediation key so we do not re-dispatch across runs.
 
     Keyed by advisory + package (not manifest): one advisory can raise several
     alerts for the SAME package pinned in multiple manifests, and a single
     Devin session bumps the package across the whole repo. Keying on manifest
     too would dispatch a separate session per manifest for one CVE, so the key
     deliberately omits manifest_path to collapse those into one remediation.
-    Keyed by advisory + package (not manifest): one advisory can raise several
-    alerts for the SAME package pinned in multiple manifests, and a single
-    Devin session bumps the package across the whole repo. Keying on manifest
-    too would dispatch a separate session per manifest for one CVE, so the key
-    deliberately omits manifest_path to collapse those into one remediation.
     """
-    return f"{repo}#{cat['ghsa_id'] or cat['number']}#{cat['package']}"
     return f"{repo}#{cat['ghsa_id'] or cat['number']}#{cat['package']}"
 
 def _load_prompt_template(name):
@@ -599,10 +648,8 @@ def get_devin_session(session_id):
         )
     except requests.RequestException as exc:
         warn_once(f"could not fetch session {session_id} ({exc})")
-        warn_once(f"could not fetch session {session_id} ({exc})")
         return None
     if response.status_code != 200:
-        warn_once(f"could not fetch session {session_id} ({response.status_code})")
         warn_once(f"could not fetch session {session_id} ({response.status_code})")
         return None
     return response.json()
@@ -623,10 +670,8 @@ def send_session_message(session_id, message):
         )
     except requests.RequestException as exc:
         warn_once(f"could not message session {session_id} ({exc})")
-        warn_once(f"could not message session {session_id} ({exc})")
         return False
     if response.status_code not in (200, 201, 204):
-        warn_once(f"could not message session {session_id} ({response.status_code})")
         warn_once(f"could not message session {session_id} ({response.status_code})")
         return False
     return True
@@ -671,7 +716,6 @@ def discover_pr(repo, entry, session):
                     return pr.get("html_url"), pr.get("number"), "ghsa_search"
         except requests.RequestException as exc:
             warn_once(f"PR search failed for {ghsa} ({exc})")
-            warn_once(f"PR search failed for {ghsa} ({exc})")
     return None, None, None
 
 
@@ -698,7 +742,6 @@ def ci_status(repo, pr_number):
             return "unknown"
         check_runs = runs.json().get("check_runs", [])
     except requests.RequestException as exc:
-        warn_once(f"CI status fetch failed for PR #{pr_number} ({exc})")
         warn_once(f"CI status fetch failed for PR #{pr_number} ({exc})")
         return "unknown"
     if not check_runs:
@@ -767,10 +810,8 @@ def post_pr_comment(repo, pr_number, body):
         )
     except requests.RequestException as exc:
         warn_once(f"could not comment on PR #{pr_number} ({exc})")
-        warn_once(f"could not comment on PR #{pr_number} ({exc})")
         return False
     if response.status_code not in (200, 201):
-        warn_once(f"could not comment on PR #{pr_number} ({response.status_code})")
         warn_once(f"could not comment on PR #{pr_number} ({response.status_code})")
         return False
     return True
@@ -823,9 +864,7 @@ def open_tracking_issue(repo, entry, session_log=None):
         if response.status_code in (200, 201):
             return response.json().get("html_url")
         warn_once(f"could not open tracking issue ({response.status_code})")
-        warn_once(f"could not open tracking issue ({response.status_code})")
     except requests.RequestException as exc:
-        warn_once(f"could not open tracking issue ({exc})")
         warn_once(f"could not open tracking issue ({exc})")
     return None
 
@@ -860,9 +899,7 @@ def file_run_summary(repo, mode, counts, details, dry_run):
             print(f"SUMMARY filed: {response.json().get('html_url')}")
         else:
             warn_once(f"could not file run summary ({response.status_code})")
-            warn_once(f"could not file run summary ({response.status_code})")
     except requests.RequestException as exc:
-        warn_once(f"could not file run summary ({exc})")
         warn_once(f"could not file run summary ({exc})")
 
 
@@ -1118,16 +1155,21 @@ def main():
     else:
         state = load_state()
 
-    # Dependabot auto-opens PRs for the trivial patch-available bumps; skip those so
-    # Devin only handles what Dependabot can't (breaking/major bumps, no clean patch).
-    dep_prs = fetch_open_dependabot_prs(repo)
-    if dep_prs:
-        print(f"Found {len(dep_prs)} open Dependabot PR(s); will skip alerts they already cover.")
+    # One PR listing serves both dedup paths: an open fix PR a prior scan (or a
+    # human) already opened is matched by advisory id (find_fix_pr) and never
+    # duplicated; Dependabot's own bump PRs are the subset routed by the
+    # sensitivity/cascade rules below.
+    open_prs = fetch_open_fix_prs(repo)
+    dep_prs = [pr for pr in open_prs if pr["author"] in DEPENDABOT_LOGINS]
+    if open_prs:
+        print(
+            f"Found {len(open_prs)} open PR(s) ({len(dep_prs)} Dependabot); "
+            "will skip alerts already covered by one."
+        )
 
     # Categorize everything, then decide. Non-dispatch outcomes are reported up front.
     # Pass 1: categorize everything and split into skips vs. the dispatch queue.
     queue = []
-    queued_keys = set()  # advisory+package already queued this run (multi-manifest dedup)
     queued_keys = set()  # advisory+package already queued this run (multi-manifest dedup)
     details = []  # one markdown bullet per decision, for the run-summary issue
     delegated = 0  # alerts routed to Dependabot on predicted capability (pass 1)
@@ -1135,10 +1177,6 @@ def main():
         cat = categorize_alert(alert)
         key = state_key(repo, cat)
         label = f"[{cat['severity']}] {cat['package']} ({cat['ghsa_id']})"
-
-        if key in queued_keys:
-            print(f"SKIP  {label}: same advisory already queued this run (another manifest)")
-            continue
 
         if key in queued_keys:
             print(f"SKIP  {label}: same advisory already queued this run (another manifest)")
@@ -1157,6 +1195,15 @@ def main():
             print(f"{verdict:5s} {label}: {reason}")
             emoji = "⏸️ HELD" if verdict == "HELD" else "⏭️ SKIP"
             details.append(f"- {emoji} {label} — {reason}")
+            continue
+
+        # Don't duplicate in-flight work: a fix PR a prior scan (or a human) already
+        # opened for this advisory covers it. Dependabot's own bump PRs are handled
+        # below so the sensitivity/cascade precedence still applies to them.
+        fix_pr = find_fix_pr(cat, open_prs)
+        if fix_pr is not None and fix_pr.get("author", "") not in DEPENDABOT_LOGINS:
+            print(f"SKIP  {label}: an open fix PR already remediates this advisory (#{fix_pr.get('number')})")
+            details.append(f"- ⏭️ SKIP {label} — fix PR #{fix_pr.get('number')} already open")
             continue
 
         sensitive = is_sensitive(cat)
