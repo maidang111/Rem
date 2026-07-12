@@ -313,6 +313,128 @@ def is_sensitive(cat):
     return _normalize_package(cat["package"]) in SENSITIVE_PACKAGES
 
 
+def fetch_manifest_content(repo, manifest_path):
+    """Return the text of ``manifest_path`` in ``repo``'s default branch, or None.
+
+    None means "couldn't determine" (missing path, fetch error) so callers can
+    stay conservative rather than assume the package is/ isn't declared there.
+    """
+    if not manifest_path:
+        return None
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.raw+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"{GITHUB_API}/repos/{repo}/contents/{manifest_path.lstrip('/')}"
+    try:
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        warn_once(f"could not fetch manifest {manifest_path} ({exc})")
+        return None
+    if response.status_code != 200:
+        warn_once(f"could not fetch manifest {manifest_path} ({response.status_code})")
+        return None
+    return response.text
+
+
+def package_in_manifest(repo, package_name, manifest_path):
+    """True if ``package_name`` is declared as a delimited token in ``manifest_path``.
+
+    Used only when the alert's dependency ``relationship`` is unknown, to decide
+    whether the package is a DIRECT dependency (declared in the manifest) that
+    Dependabot could bump, vs. a transitive one it can't. Returns False when the
+    manifest can't be read, so an unconfirmed dependency is NOT assumed
+    Dependabot-fixable (it falls through to Devin instead of being dropped).
+    """
+    content = fetch_manifest_content(repo, manifest_path)
+    if content is None:
+        return False
+    pkg = _normalize_package(package_name)
+    if not pkg:
+        return False
+    # Match the package as a delimited token so "redis" doesn't match "redis-py-cluster".
+    return re.search(rf"(^|[\s\"'/@]){re.escape(pkg)}([\s\"'/@=<>~!,;:\[\](){{}}-]|$)",
+                     content.lower(), re.MULTILINE) is not None
+
+
+_VERSION_RE = re.compile(r"\d+(?:\.\d+){0,2}")
+_UPPER_BOUND_RE = re.compile(r"(<=?)\s*v?(\d+(?:\.\d+){0,2})")
+
+
+def _parse_version(version):
+    """Return ``(major, minor, patch)`` for a version string, or None."""
+    match = re.match(r"\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", version or "")
+    if not match:
+        return None
+    return tuple(int(part) if part else 0 for part in match.groups())
+
+
+def is_major_bump(vulnerable_range, patched_identifier):
+    """True if reaching ``patched_identifier`` crosses a major version.
+
+    A major bump likely carries API removals — Devin's lane, not a version-number
+    edit Dependabot can make. We derive the highest still-VULNERABLE major from the
+    range's upper bound (``< 3.0.0`` means 2.x is the top vulnerable major, since
+    3.0.0 is excluded; ``< 3.4.0`` keeps 3.x vulnerable), then compare it to the
+    patched major. Returns True when it can't tell, so an ambiguous bump is treated
+    as risky (sent to Devin, not left to Dependabot).
+    """
+    patched = _parse_version(patched_identifier)
+    if patched is None:
+        return True
+    patched_major = patched[0]
+
+    bound = _UPPER_BOUND_RE.search(vulnerable_range or "")
+    if bound:
+        op = bound.group(1)
+        umajor, uminor, upatch = _parse_version(bound.group(2))
+        if op == "<" and uminor == 0 and upatch == 0:
+            # Exclusive bound on a major boundary (< 3.0.0): 3.x is not vulnerable,
+            # so the top vulnerable major is one below.
+            max_vulnerable_major = umajor - 1
+        else:
+            max_vulnerable_major = umajor
+        return patched_major > max_vulnerable_major
+
+    # No parseable upper bound; fall back to the highest version named in the range.
+    majors = [_parse_version(v)[0] for v in _VERSION_RE.findall(vulnerable_range or "")]
+    if not majors:
+        return True
+    return patched_major > max(majors)
+
+
+def dependabot_capable(repo, cat, cascade_count):
+    """True if Dependabot can fix this alert on its own, without code changes.
+
+    Predictive (not reactive): lets the scanner leave the trivial, in-major,
+    direct-dependency bumps to Dependabot BEFORE Dependabot has opened a PR, so a
+    Devin session is spent only on what Dependabot can't do. Conservative on every
+    unknown — when a signal can't be determined it errs toward "not capable" so the
+    alert falls through to Devin rather than being dropped.
+    """
+    if not cat["has_fix"]:
+        return False  # held lane anyway; no patched version to bump to
+
+    # 1. Direct dependency only — Dependabot can't fix transitive deps outside npm.
+    relationship = cat.get("relationship") or "unknown"
+    if relationship == "transitive":
+        return False
+    if relationship == "unknown":
+        if not package_in_manifest(repo, cat["package"], cat["manifest_path"]):
+            return False
+
+    # 2. Bump-safe: the patched version stays within the current major.
+    if is_major_bump(cat["vulnerable_range"], cat["patched_version"]):
+        return False
+
+    # 3. No cascade to other packages (only known once --check computed it).
+    if cascade_count is not None and cascade_count > 0:
+        return False
+
+    return True
+
+
 def categorize_alert(alert):
     """Extract the decision-relevant fields from a raw Dependabot alert."""
     advisory = alert.get("security_advisory", {})
@@ -953,13 +1075,14 @@ def main():
         # --check: compute the upgrade's transitive cascade from the Dependabot PR's
         # dependency graph (base...head). If it touches more than MAX_CASCADE other
         # packages, escalate to a reviewed upgrade instead of letting it auto-merge.
+        cascade_count = None
         cascade_escalated = False
         if args.check and has_dep_pr:
-            n = cascade_package_count(repo, fix_pr.get("base_ref"), fix_pr.get("head_ref"), cat)
-            if n is not None and n > MAX_CASCADE:
+            cascade_count = cascade_package_count(repo, fix_pr.get("base_ref"), fix_pr.get("head_ref"), cat)
+            if cascade_count is not None and cascade_count > MAX_CASCADE:
                 cascade_escalated = True
                 print(
-                    f"CHECK {label}: upgrade cascades to {n} other packages "
+                    f"CHECK {label}: upgrade cascades to {cascade_count} other packages "
                     f"(> MAX_CASCADE={MAX_CASCADE}); escalating to reviewed upgrade."
                 )
 
@@ -971,6 +1094,15 @@ def main():
         if has_dep_pr and not review:
             print(f"SKIP  {label}: Dependabot already has an open PR for this package")
             details.append(f"- ⏭️ SKIP {label} — Dependabot PR already open")
+            continue
+
+        # Predictive owner routing: even before Dependabot opens a PR, if this is a
+        # trivial bump Dependabot can land on its own (direct dep, in-major, no
+        # cascade), leave it to Dependabot rather than spend a Devin session -- unless
+        # it's a sensitive/cascade-escalated alert that must get a reviewed upgrade.
+        if not review and dependabot_capable(repo, cat, cascade_count):
+            print(f"SKIP  {label}: Dependabot can resolve this on its own (direct, in-major, no cascade)")
+            details.append(f"- ⏭️ SKIP {label} — Dependabot-capable, left to Dependabot")
             continue
 
         if sensitive:
