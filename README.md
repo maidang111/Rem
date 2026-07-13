@@ -209,6 +209,36 @@ ngrok http 5000          # point the repo's webhook at <ngrok-url>/webhook,
 
 Label an issue `Remediate` and the orchestrator dispatches it.
 
+### Docker
+
+Both lanes ship in a single image. Build once, then run either the webhook
+server or the scanner from it.
+
+```bash
+cp .env.example .env   # fill in DEVIN_API_KEY, GITHUB_TOKEN, WEBHOOK_SECRET
+docker build -t rem .
+```
+
+Webhook orchestrator (served under gunicorn on `:5000`):
+
+```bash
+docker run --rm -p 5000:5000 --env-file .env rem
+# or, with compose:
+docker compose up webhook
+```
+
+One-shot scanner — override the command to run `dependabot_scan.py`:
+
+```bash
+docker run --rm --env-file .env rem python dependabot_scan.py --dry-run
+# or, with compose (the "scanner" service):
+docker compose run --rm scanner --dry-run
+docker compose run --rm scanner --reconcile
+```
+
+The compose `scanner` service mounts `.dependabot_state.json` from the host so
+per-alert state persists across one-shot runs.
+
 ## Configuration
 
 All via environment variables (see `.env.example`):
@@ -263,6 +293,5 @@ tuned without touching code.
 - Manifest parsing for delegation covers pip-style pins (`pkg==x.y.z`) and
   `package.json` entries; other lockfile formats fall back to the vulnerable
   range's lower bound or route to Devin.
-- Docker packaging planned.
 - Exploitability signals (e.g. EPSS) as a ranking input alongside severity.
 - Devin Review integration to catch vulnerable dependencies at PR time.

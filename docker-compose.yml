@@ -1,0 +1,26 @@
+services:
+  # Lane 2 — issue webhook orchestrator (app.py), served under gunicorn.
+  webhook:
+    build: .
+    image: rem
+    env_file: .env
+    ports:
+      - "${PORT:-5000}:5000"
+    environment:
+      PORT: 5000
+    restart: unless-stopped
+
+  # Lane 1 — Dependabot alert scanner (dependabot_scan.py), a one-shot run.
+  # Not started by `docker compose up`; invoke explicitly, e.g.:
+  #   docker compose run --rm scanner --dry-run
+  #   docker compose run --rm scanner --reconcile
+  scanner:
+    build: .
+    image: rem
+    env_file: .env
+    profiles: ["scanner"]
+    entrypoint: ["python", "dependabot_scan.py"]
+    command: ["--dry-run"]
+    volumes:
+      # Persist per-alert lifecycle state across one-shot runs.
+      - ./.dependabot_state.json:/app/.dependabot_state.json
