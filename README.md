@@ -163,111 +163,106 @@ The decisions the routing and lifecycle above are built on:
 ## Setup
 
 The two lanes are independent — you can activate one without the other. Both
-share the same install and the same `.env`.
+run from the same Docker image and the same `.env`.
 
-**Common install (both lanes):**
+### 1. Build the image
 
-```bash
-git clone https://github.com/maidang111/Rem.git && cd Rem
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env   # then fill in DEVIN_API_KEY, GITHUB_TOKEN, WEBHOOK_SECRET
-```
-
-The GitHub token needs Dependabot alerts (read), contents (read), pull
-requests (read), and issues (write, for tracking/summary issues).
-
-### Lane 1 — Activate the scanner (`dependabot_scan.py`)
-
-The scanner is a **run-once script**, not a server — there is no backend to
-keep running. You "activate" it by running it, either by hand or on a schedule.
-
-Run it by hand (`SCAN_REPO` in `.env` picks the repo it scans):
+Install [Docker](https://docs.docker.com/get-docker/) (Docker Desktop on
+Mac/Windows, `docker` + the compose plugin on Linux), then:
 
 ```bash
-python dependabot_scan.py --dry-run        # categorize + decide, touch nothing
-python dependabot_scan.py                  # dispatch/delegate (up to MAX_DISPATCH sessions)
-python dependabot_scan.py --check          # also compute upgrade cascades where a
-                                           # Dependabot PR exists to diff against
-python dependabot_scan.py --reconcile      # advance all state entries one step
-python dependabot_scan.py --force GHSA-... # re-dispatch a specific alert
-python dependabot_scan.py --reset          # clear state; reconsider every open alert
-```
-
-Always start with `--dry-run` and read the decision ledger before a real run.
-
-Run it on a schedule with **GitHub Actions** (no server needed — GitHub
-provisions a runner, installs deps, and runs the script for you on a cron). The
-workflow already lives at `.github/workflows/dependabot-scan.yml` and runs
-weekday mornings (`cron: '0 13 * * 1-5'`, UTC). To activate it:
-
-- Add two repository secrets under **Settings → Secrets and variables →
-  Actions**: `DEPENDABOT_SCAN_TOKEN` (a PAT with `security_events`/`repo` scope
-  — the built-in `GITHUB_TOKEN` can't read another repo's alerts) and
-  `DEVIN_API_KEY`.
-- Make sure Actions is enabled for the repo. Change the `cron:` line to adjust
-  cadence, or trigger a run on demand from the **Actions** tab (the workflow
-  also allows `workflow_dispatch`).
-
-### Lane 2 — Activate the issue webhook (`app.py`)
-
-The webhook lane **is** a long-running server that GitHub pushes events to, so
-activating it is two steps: start the server, then register the webhook.
-
-1. Start the server:
-
-   ```bash
-   python app.py            # starts on :5000 (PORT to override)
-   # or, for the whole setup + start in one shot:
-   ./run.sh                 # creates .venv, installs deps, copies .env, starts :5000
-   ```
-
-2. Make it reachable and register the webhook so GitHub can call it. Locally,
-   expose the port with a tunnel:
-
-   ```bash
-   ngrok http 5000          # gives you a public https URL
-   ```
-
-   Then in the target repo: **Settings → Webhooks → Add webhook** —
-   - **Payload URL:** `<public-url>/webhook`
-   - **Content type:** `application/json`
-   - **Secret:** the same value as `WEBHOOK_SECRET` in `.env`
-   - **Events:** "Let me select individual events" → **Issues**
-
-Once registered, label any issue `Remediate` and the orchestrator dispatches a
-Devin session. (`GET /health` returns `{"status":"healthy"}` if the server is
-up.)
-
-### Docker
-
-Both lanes ship in a single image. Build once, then run either the webhook
-server or the scanner from it.
-
-```bash
+cd Rem
 cp .env.example .env   # fill in DEVIN_API_KEY, GITHUB_TOKEN, WEBHOOK_SECRET
 docker build -t rem .
 ```
 
-Webhook orchestrator (served under gunicorn on `:5000`):
+Both lanes ship in this single image — build once, then run either the
+webhook server or the scanner from it. The GitHub token needs Dependabot
+alerts (read), contents (read), pull requests (read), and issues (write, for
+tracking/summary issues).
+
+Prefer running without Docker? A local venv works too:
 
 ```bash
-docker run --rm -p 5000:5000 --env-file .env rem
-# or, with compose:
-docker compose up webhook
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-One-shot scanner — override the command to run `dependabot_scan.py`:
+### 2. Lane 1 — the scanner (`dependabot_scan.py`)
+
+There are two ways to run the scanner. It's a run-once script, not a server —
+each invocation scans, decides, dispatches, and exits.
+
+**Option A — GitHub Actions (no infrastructure).** The workflow lives at
+`.github/workflows/dependabot-scan.yml` and runs weekday mornings
+(`cron: '0 13 * * 1-5'`, UTC). It also allows `workflow_dispatch`, so you can
+trigger a run on demand from the **Actions** tab — pick the workflow and hit
+**Run workflow**. To activate it:
+
+1. Add two repository secrets under **Settings → Secrets and variables →
+   Actions**: `DEPENDABOT_SCAN_TOKEN` (a PAT with `security_events`/`repo`
+   scope — the built-in `GITHUB_TOKEN` can't read another repo's alerts) and
+   `DEVIN_API_KEY`.
+2. Make sure Actions is enabled for the repo. Edit the `cron:` line to change
+   cadence.
+
+**Option B — run it yourself.** `SCAN_REPO` in `.env` picks the repo it scans:
 
 ```bash
-docker run --rm --env-file .env rem python dependabot_scan.py --dry-run
-# or, with compose (the "scanner" service):
-docker compose run --rm scanner --dry-run
-docker compose run --rm scanner --reconcile
+docker compose run --rm scanner --dry-run    # categorize + decide, touch nothing
+docker compose run --rm scanner              # dispatch/delegate (up to MAX_DISPATCH)
+docker compose run --rm scanner --reconcile  # advance all state entries one step
 ```
 
+Or directly, with the venv activated:
+
+```bash
+python dependabot_scan.py --dry-run
+python dependabot_scan.py
+python dependabot_scan.py --check            # also compute upgrade cascades
+python dependabot_scan.py --reconcile
+python dependabot_scan.py --force GHSA-...   # re-dispatch a specific alert
+python dependabot_scan.py --reset            # clear state; reconsider every alert
+```
+
+Always start with `--dry-run` and read the decision ledger before a real run.
 The compose `scanner` service mounts `.dependabot_state.json` from the host so
 per-alert state persists across one-shot runs.
+
+### 3. Lane 2 — the issue webhook (`app.py`)
+
+The webhook lane **is** a long-running server that GitHub pushes events to.
+Activating it is two steps: start the server, then register the webhook on
+every repo that should feed it.
+
+**Start the server:**
+
+```bash
+docker run --rm -p 5000:5000 --env-file .env rem   # gunicorn on :5000
+# or, with compose:
+docker compose up webhook
+# or, without Docker:
+./run.sh                 # creates .venv, installs deps, copies .env, starts :5000
+```
+
+`GET /health` returns `{"status":"healthy"}` if the server is up.
+
+**Register the webhook on a target repo.** GitHub needs a public URL to call.
+Locally, expose the port with a tunnel:
+
+```bash
+ngrok http 5000          # gives you a public https URL
+```
+
+Then, in each repo you want Rem to watch: **Settings → Webhooks → Add
+webhook** —
+
+- **Payload URL:** `<public-url>/webhook`
+- **Content type:** `application/json`
+- **Secret:** the same value as `WEBHOOK_SECRET` in `.env`
+- **Events:** "Let me select individual events" → **Issues**
+
+Once registered, label any issue `Remediate` and the orchestrator dispatches a Devin session.
 
 ## Configuration
 
