@@ -1,6 +1,6 @@
 # Rem
 
-Rem (short for **Rem**ediation) is an orchestration layer for automated
+Rem (short for **Rem**ediation) is an orchestration layer for automated dependency related
 security remediation. It sits between vulnerability detection (Dependabot
 alerts, GitHub issues) and execution (Dependabot, Devin, humans) and decides
 which findings get fixed, in what order, and by whom.
@@ -8,8 +8,7 @@ which findings get fixed, in what order, and by whom.
 Devin writes the patches and opens the PRs. Rem decides what Devin works on.
 
 Built and demonstrated against a fork of
-[apache/superset](https://github.com/maidang111/superset), a real repo with
-real open CVE alerts.
+[apache/superset](https://github.com/maidang111/superset)
 
 ## Architecture
 
@@ -72,11 +71,6 @@ and the patched version stays within the installed major (read from the
 manifest pin, falling back to the vulnerable range's lower bound). Anything
 it can't verify falls through to Devin, and the reason is printed either
 way — every routing decision in the ledger explains itself:
-
-```
-DELEG [high] Werkzeug (GHSA-...): in-major bump 3.0.1 → 3.0.3 (manifest pin), direct; ...
-DISPATCH [high] gunicorn (GHSA-...) [major bump 22.x → 23.x — code migration is Devin's lane]
-```
 
 A delegation is a prediction, so it gets a deadline: if Dependabot's PR
 hasn't appeared within `DEPENDABOT_WAIT_HOURS`, the reconcile pass dispatches
@@ -283,15 +277,3 @@ tuned without touching code.
   starts with context.
 - **PR labels** — `rem:routine-bump` vs `rem:needs-careful-review` for
   at-a-glance triage in the PR list.
-
-## Known limitations / roadmap
-
-- Webhook dedup is in-memory; restarting the server forgets dispatched
-  issues. SQLite-backed registry planned.
-- Cascade computation (`--check`) requires an existing Dependabot PR to diff
-  against, so cascade checks don't run for alerts Dependabot hasn't touched.
-- Manifest parsing for delegation covers pip-style pins (`pkg==x.y.z`) and
-  `package.json` entries; other lockfile formats fall back to the vulnerable
-  range's lower bound or route to Devin.
-- Exploitability signals (e.g. EPSS) as a ranking input alongside severity.
-- Devin Review integration to catch vulnerable dependencies at PR time.
