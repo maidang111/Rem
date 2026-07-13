@@ -53,16 +53,6 @@ Routing rules, in the order the code applies them:
 | 6 | Dependabot is *capable* of the fix (see below) | **DELEGATED** to Dependabot, with a deadline |
 | 7 | Everything else with a patch | **Devin, routine-upgrade prompt** — PR labeled `rem:routine-bump` |
 
-Rule 3 dedups work already in flight (matched by advisory id, so it catches
-fix PRs from any author); rule 5 is the narrower Dependabot-bump dedup matched
-by package name. Sensitivity/cascade (rule 4) sits **above** the Dependabot
-skip and capability delegation, so a sensitive package is never delegated or
-skipped-as-Dependabot's even when the bump is trivial.
-
-Severity ranks the queue; it does not gate it. If a patch exists the default
-is to take it — `SEVERITY_THRESHOLD` exists as a deployment knob, not a
-default filter.
-
 **Predictive delegation (rule 5).** Rule 4 is reactive — it only fires if
 Dependabot has already opened a PR. Rule 5 routes on capability instead:
 `dependabot_capable()` returns true when the dependency is verifiably direct
@@ -70,19 +60,13 @@ Dependabot has already opened a PR. Rule 5 routes on capability instead:
 and the patched version stays within the installed major (read from the
 manifest pin, falling back to the vulnerable range's lower bound). Anything
 it can't verify falls through to Devin, and the reason is printed either
-way — every routing decision in the ledger explains itself:
+way.
 
 A delegation is a prediction, so it gets a deadline: if Dependabot's PR
 hasn't appeared within `DEPENDABOT_WAIT_HOURS`, the reconcile pass dispatches
 the alert to Devin. If the PR appears but its CI goes red — the bump alone
 broke something — it is also promoted to Devin, since that is now a code
 migration, not a version edit.
-
-**State.** Every handled alert gets an entry in `.dependabot_state.json`,
-keyed `repo#ghsa_id#package` (deliberately not per-manifest: one advisory can
-raise alerts in several manifests, and one Devin session bumps the package
-repo-wide). Re-runs are incremental — only net-new alerts are considered.
-
 ```
 delegated  → dependabot_pr_open → verified          (Dependabot PR, CI green)
           ↘ deadline passed / PR red → dispatched   (promoted to Devin)
