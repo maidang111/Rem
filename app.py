@@ -1,3 +1,15 @@
+"""Rem — Lane 2: Webhook Orchestrator.
+
+This service is intentionally dependency-agnostic. Lane 1 (the Dependabot
+scanner) reads CVE alerts, triages severity, and encodes all dependency
+context — package, version, CVE ID, advisory summary — into a GitHub issue,
+then applies the `Remediate` label to promote it to the agent lane.
+
+This file consumes those issues. It verifies the webhook signature, gates on
+the label, dedups redispatch, and hands the issue body to Devin via the
+remediation prompt template. All dependency intelligence lives upstream in
+the scanner; the routing contract between lanes is the label.
+"""
 import os
 import hmac
 import hashlib
@@ -25,6 +37,10 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # used by ingest/emit, not this file
 SUPERSET_REPO = os.getenv("SUPERSET_REPO", "maidang111/superset")
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 
+# Gate 5 — routing fork. Only the agent lane dispatches.
+# The `Remediate` label is the contract with the scanner (lane 1).
+# Production hardening: verify issue author == scanner identity, not
+# just the label, since anyone with triage perms can apply labels.
 DISPATCH_LABEL = "Remediate"
 
 _missing = [name for name, val in [
