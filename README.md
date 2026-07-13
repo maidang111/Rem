@@ -53,8 +53,8 @@ Routing rules, in the order the code applies them:
 | 6 | Dependabot is *capable* of the fix (see below) | **DELEGATED** to Dependabot, with a deadline |
 | 7 | Everything else with a patch | **Devin, routine-upgrade prompt** — PR labeled `rem:routine-bump` |
 
-**Predictive delegation (rule 5).** Rule 4 is reactive — it only fires if
-Dependabot has already opened a PR. Rule 5 routes on capability instead:
+**Predictive delegation (rule 6).** Rule 5 is reactive — it only fires if
+Dependabot has already opened a PR. Rule 6 routes on capability instead:
 `dependabot_capable()` returns true when the dependency is verifiably direct
 (the API's `relationship` field, or a top-level pin found in the manifest)
 and the patched version stays within the installed major (read from the
@@ -155,7 +155,7 @@ Install [Docker](https://docs.docker.com/get-docker/) (Docker Desktop on
 Mac/Windows, `docker` + the compose plugin on Linux), then:
 
 ```bash
-cd Rem
+unzip Rem.zip && cd Rem
 cp .env.example .env   # fill in DEVIN_API_KEY, GITHUB_TOKEN, WEBHOOK_SECRET
 docker build -t rem .
 ```
